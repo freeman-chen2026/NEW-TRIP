@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-航班行程安排助手（含自动调机估算）
+航班行程安排助手
+先选飞机，再给需求，自动排出该飞机新增后的完整行程。
 """
 
 import streamlit as st
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta, date
 
 st.set_page_config(page_title="航班行程安排助手", page_icon="✈️", layout="wide")
 st.title("✈️ 航班行程安排助手")
-st.caption("输入现有航班计划和潜在行程，自动分析并推荐最佳安排（无飞机在出发城市时自动估算调机）")
+st.caption("粘贴计划 → 选择飞机 → 填需求 → 自动排出完整行程")
 
 
 # ================================================================
@@ -83,7 +84,7 @@ def get_icao(city):
 
 
 # ================================================================
-# 机场经纬度（用于调机时间估算）
+# 机场坐标
 # ================================================================
 AIRPORT_COORDS = {
     "ZBAD": (39.509, 116.411), "ZBAA": (40.079, 116.585),
@@ -147,7 +148,6 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def estimate_flight_minutes(from_icao, to_icao):
-    """估算两个机场间的飞行时间（分钟）。巡航 ~800 km/h，+ 25 min 起降。"""
     if not from_icao or not to_icao:
         return None
     if from_icao == to_icao:
@@ -276,7 +276,7 @@ def assign_dates(flights, start_date):
 
 
 # ================================================================
-# 解析潜在行程请求
+# 解析需求
 # ================================================================
 def _is_schedule_line(s):
     if not s:
@@ -359,279 +359,272 @@ def parse_request(text):
             if hh < 24 and mm < 60:
                 flight_min = hh * 60 + mm
 
-    reg = None
-    m = re.search(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{3,7})(?![A-Za-z0-9])", clean_text)
-    if m:
-        reg = m.group(1)
-
     return {
         "date": target_date, "route": route, "flight_min": flight_min,
-        "reg": reg, "raw": clean_text, "no_content": no_content,
+        "raw": clean_text, "no_content": no_content,
     }
 
 
 # ================================================================
-# 分析
+# 分析某一架飞机
 # ================================================================
 DUTY_MAX_MIN = 14 * 60
 FLIGHT_MAX_MIN = 10 * 60
 REST_MIN = 10 * 60
 
 
-def analyze(flights, request):
-    if request.get("no_content"):
-        return {"errors": ["NO_CONTENT"]}
+def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
+                     flight_min, transit, plan_min):
+    """分析单架飞机，返回完整行程计划或错误信息"""
 
-    missing = []
-    if not request["date"]:
-        missing.append("**日期**（如 `10.4` 或 `10月4日`）")
-    if not request["route"]:
-        missing.append("**航线**（如 `澳门-老挝万象`）")
-    if not request["flight_min"]:
-        missing.append("**飞行时间**（如 `0158`、`1h58m`）")
-    if missing:
-        return {"errors": ["MISSING_FIELDS", missing]}
-
-    target_date = request["date"]
-    dep_city, arr_city = request["route"]
     dep_icao = get_icao(dep_city)
     arr_icao = get_icao(arr_city)
-
     if not dep_icao:
-        return {"errors": [f"❌ 无法识别出发城市：{dep_city}"]}
+        return {"error": f"❌ 无法识别出发城市：{dep_city}"}
     if not arr_icao:
-        return {"errors": [f"❌ 无法识别到达城市：{arr_city}"]}
+        return {"error": f"❌ 无法识别到达城市：{arr_city}"}
 
-    flight_min = request["flight_min"]
-    plan_min = plan_minutes(flight_min)
-    transit = transit_minutes(dep_icao)
+    reg_flights = [f for f in flights_all if f["reg"] == reg]
+    reg_flights.sort(key=lambda x: (x["date"], time_str_to_min(x["dep_time"]) or 0))
 
-    by_date_reg = {}
-    for f in flights:
-        by_date_reg.setdefault((f["date"], f["reg"]), []).append(f)
+    before = [f for f in reg_flights if f["date"] <= target_date]
+    day_flights = [f for f in reg_flights if f["date"] == target_date]
+    day_flights.sort(key=lambda x: time_str_to_min(x["dep_time"]) or 0)
 
-    all_regs = sorted(set(f["reg"] for f in flights))
-    if request["reg"]:
-        all_regs = [r for r in all_regs if r == request["reg"]] or all_regs
+    if not before:
+        return {"error": f"❌ 所选飞机 {reg} 在 {target_date.strftime('%m月%d日')} 之前没有任何航段，无法定位飞机位置。"}
 
-    results = []
-
-    for reg in all_regs:
-        reg_flights = [f for f in flights if f["reg"] == reg]
-        reg_flights.sort(key=lambda x: (x["date"], time_str_to_min(x["dep_time"]) or 0))
-
-        before = [f for f in reg_flights if f["date"] <= target_date]
-        day_flights = [f for f in reg_flights if f["date"] == target_date]
-        day_flights.sort(key=lambda x: time_str_to_min(x["dep_time"]) or 0)
-
-        # ============ 情况 A：当天在 dep_city ============
-        if day_flights:
-            day_last = day_flights[-1]
-            last_arr_icao = get_icao(day_last["arr_city"])
-            if last_arr_icao == dep_icao:
-                first_dep = time_str_to_min(day_flights[0]["dep_time"])
-                last_arr = time_str_to_min(day_last["arr_time"])
-                duty_start = first_dep - 120
-                duty_end = last_arr + 60
-
-                old_flight = 0
-                for f in day_flights:
-                    d = time_str_to_min(f["dep_time"])
-                    a = time_str_to_min(f["arr_time"])
-                    if d is not None and a is not None:
-                        old_flight += (a - d) if a >= d else (a + 1440 - d)
-
-                main_dep = last_arr + transit
-                main_arr = main_dep + plan_min
-                new_duty_end = main_arr + 60
-                new_duty_total = new_duty_end - duty_start
-                new_flight_total = old_flight + flight_min
-
-                results.append({
-                    "reg": reg,
-                    "day_flights": day_flights,
-                    "crew": day_flights[0].get("crew", []),
-                    "duty_start": duty_start, "duty_end": duty_end,
-                    "duty_total": duty_end - duty_start,
-                    "old_flight": old_flight,
-                    "ferry_info": None,
-                    "transit": transit,
-                    "main_dep": main_dep, "main_arr": main_arr,
-                    "new_duty_end": new_duty_end,
-                    "new_duty_total": new_duty_total,
-                    "new_flight_total": new_flight_total,
-                    "ok_duty": new_duty_total <= DUTY_MAX_MIN,
-                    "ok_flight": new_flight_total <= FLIGHT_MAX_MIN,
-                    "rest_ok": True, "rest_note": "",
-                    "plan_min": plan_min, "flight_min": flight_min,
-                })
-                continue
-
-        # ============ 情况 B：需要调机 ============
-        if not before:
-            continue
-
-        last_seg = before[-1]
-        last_city_icao = get_icao(last_seg["arr_city"])
-        if last_city_icao == dep_icao:
-            # 就是前一天到的，日期偏差问题不大，按当天处理
-            if last_seg["date"] != target_date:
-                # 前一天到 dep_city，可以第二天一早出发
-                ferry_dep_min = 8 * 60  # 默认 08:00 出发（可调）
-                ferry_min = 0
-                ferry_plan_min = 0
-                ferry_arr_min = ferry_dep_min
-            else:
-                continue
+    # ---- 计算调机需求 ----
+    ferry_info = None
+    if day_flights:
+        last_of_day = day_flights[-1]
+        if get_icao(last_of_day["arr_city"]) == dep_icao:
+            # 目标当天已有飞机在 dep_city，直接接
+            ferry_info = None
         else:
-            ferry_min = estimate_flight_minutes(last_city_icao, dep_icao)
-            if ferry_min is None or ferry_min <= 0:
-                continue
-
-            # 调机段起飞时间
-            if last_seg["date"] == target_date:
-                last_arr_min = time_str_to_min(last_seg["arr_time"])
-                transit_before_ferry = transit_minutes(last_city_icao)
-                ferry_dep_min = last_arr_min + transit_before_ferry
-            else:
-                ferry_dep_min = 8 * 60  # 前一天或更早到的，默认次日 08:00
-
+            # 目标当天有航段但最后不在 dep_city，需要调机
+            ferry_from_city = last_of_day["arr_city"]
+            ferry_from_icao = get_icao(ferry_from_city)
+            ferry_min = estimate_flight_minutes(ferry_from_icao, dep_icao)
+            if ferry_min is None:
+                return {"error": f"❌ 缺少坐标数据，无法估算 {ferry_from_icao} → {dep_icao} 的调机时间。"}
+            last_arr_min = time_str_to_min(last_of_day["arr_time"])
+            ferry_dep_min = last_arr_min + transit_minutes(ferry_from_icao)
             ferry_plan_min = plan_minutes(ferry_min)
             ferry_arr_min = ferry_dep_min + ferry_plan_min
-
-        # 调机到达后，过站 + 主段
-        main_dep_min = ferry_arr_min + transit_minutes(dep_icao)
-        main_arr_min = main_dep_min + plan_min
-
-        # 值勤时间
-        if last_seg["date"] == target_date:
-            # 当天已有航段，从当天第一段起飞前 2h 开始
-            first_dep = time_str_to_min(before[0]["dep_time"]) if before else ferry_dep_min
-            for f in before:
-                if f["date"] == target_date:
-                    first_dep = time_str_to_min(f["dep_time"])
-                    break
-            duty_start = first_dep - 120
-        else:
-            duty_start = ferry_dep_min - 120
-
-        duty_end = main_arr_min + 60
-        duty_total = duty_end - duty_start
-
-        # 飞行总时长
-        old_flight = 0
-        for f in before:
-            if f["date"] == target_date:
-                d = time_str_to_min(f["dep_time"])
-                a = time_str_to_min(f["arr_time"])
-                if d is not None and a is not None:
-                    old_flight += (a - d) if a >= d else (a + 1440 - d)
-
-        total_flight = old_flight + (ferry_min or 0) + flight_min
-
-        # 前日休息
-        prev_day = target_date - timedelta(days=1)
-        rest_ok = True
-        rest_note = ""
-        for (pd, preg), prev_flights in by_date_reg.items():
-            if pd == prev_day and preg == reg:
-                prev_sorted = sorted(prev_flights, key=lambda x: time_str_to_min(x["dep_time"]))
-                prev_last_arr = time_str_to_min(prev_sorted[-1]["arr_time"])
-                prev_duty_end = prev_last_arr + 60
-                rest_hours = (duty_start - prev_duty_end) / 60
-                if rest_hours < 10:
-                    rest_ok = False
-                    rest_note = (
-                        f"前一日值勤结束 {min_to_time_str(prev_duty_end)}，"
-                        f"当日值勤开始 {min_to_time_str(duty_start)}，"
-                        f"休息仅 {rest_hours:.1f}h < 10h"
-                    )
-                break
-
-        results.append({
-            "reg": reg,
-            "day_flights": day_flights,
-            "crew": (day_flights[0].get("crew") if day_flights else (before[0].get("crew") if before else [])),
-            "duty_start": duty_start, "duty_end": duty_end,
-            "duty_total": duty_end - duty_start,
-            "old_flight": old_flight,
-            "ferry_info": {
-                "from_city": last_seg["arr_city"],
-                "from_icao": last_city_icao,
-                "from_seg": last_seg,
+            ferry_info = {
+                "from_city": ferry_from_city,
+                "from_icao": ferry_from_icao,
                 "ferry_min": ferry_min,
                 "ferry_plan_min": ferry_plan_min,
                 "dep_min": ferry_dep_min,
                 "arr_min": ferry_arr_min,
-            },
-            "transit": transit,
-            "main_dep": main_dep_min, "main_arr": main_arr_min,
-            "new_duty_end": duty_end,
-            "new_duty_total": duty_total,
-            "new_flight_total": total_flight,
-            "ok_duty": duty_total <= DUTY_MAX_MIN,
-            "ok_flight": total_flight <= FLIGHT_MAX_MIN,
-            "rest_ok": rest_ok, "rest_note": rest_note,
-            "plan_min": plan_min, "flight_min": flight_min,
+                "based_on": last_of_day,
+            }
+    else:
+        # 目标当天没航段，取该日期之前的最后一段
+        last_seg = before[-1]
+        last_city_icao = get_icao(last_seg["arr_city"])
+        if last_city_icao != dep_icao:
+            ferry_from_city = last_seg["arr_city"]
+            ferry_from_icao = last_city_icao
+            ferry_min = estimate_flight_minutes(ferry_from_icao, dep_icao)
+            if ferry_min is None:
+                return {"error": f"❌ 缺少坐标数据，无法估算 {ferry_from_icao} → {dep_icao} 的调机时间。"}
+            ferry_dep_min = 8 * 60  # 默认次日 08:00
+            ferry_plan_min = plan_minutes(ferry_min)
+            ferry_arr_min = ferry_dep_min + ferry_plan_min
+            ferry_info = {
+                "from_city": ferry_from_city,
+                "from_icao": ferry_from_icao,
+                "ferry_min": ferry_min,
+                "ferry_plan_min": ferry_plan_min,
+                "dep_min": ferry_dep_min,
+                "arr_min": ferry_arr_min,
+                "based_on": last_seg,
+            }
+        else:
+            # 目标当天没航段，但飞机已经在 dep_city
+            ferry_dep_min = 8 * 60
+            ferry_arr_min = ferry_dep_min
+            ferry_info = {
+                "from_city": dep_city,
+                "from_icao": dep_icao,
+                "ferry_min": 0,
+                "ferry_plan_min": 0,
+                "dep_min": ferry_dep_min,
+                "arr_min": ferry_arr_min,
+                "based_on": last_seg,
+            }
+
+    # ---- 主段起飞 ----
+    if ferry_info:
+        main_dep_min = ferry_info["arr_min"] + transit
+    else:
+        # 直接接在当天最后一段后
+        last_arr = time_str_to_min(day_flights[-1]["arr_time"])
+        main_dep_min = last_arr + transit
+
+    main_arr_min = main_dep_min + plan_min
+
+    # ---- 值勤时间 ----
+    if day_flights:
+        duty_start = time_str_to_min(day_flights[0]["dep_time"]) - 120
+    elif ferry_info:
+        duty_start = ferry_info["dep_min"] - 120
+    else:
+        duty_start = main_dep_min - 120
+
+    # 由于可能跨天，统一用相对分钟（相对于目标日期 00:00）
+    duty_end = main_arr_min + 60
+
+    duty_total = duty_end - duty_start
+
+    # ---- 飞行总时长 ----
+    old_flight = 0
+    for f in day_flights:
+        d = time_str_to_min(f["dep_time"])
+        a = time_str_to_min(f["arr_time"])
+        if d is not None and a is not None:
+            old_flight += (a - d) if a >= d else (a + 1440 - d)
+
+    ferry_flight = ferry_info["ferry_min"] if ferry_info else 0
+    total_flight = old_flight + ferry_flight + flight_min
+
+    # ---- 前日休息 ----
+    prev_day = target_date - timedelta(days=1)
+    rest_ok = True
+    rest_note = ""
+    for f in reg_flights:
+        if f["date"] == prev_day:
+            pass
+    prev_day_flights = [f for f in reg_flights if f["date"] == prev_day]
+    if prev_day_flights:
+        prev_last_arr = time_str_to_min(prev_day_flights[-1]["arr_time"])
+        prev_duty_end = prev_last_arr + 60
+        rest_hours = (duty_start - prev_duty_end) / 60
+        if rest_hours < 10:
+            rest_ok = False
+            rest_note = (
+                f"前一日值勤结束 {min_to_time_str(prev_duty_end)}，"
+                f"当日值勤开始 {min_to_time_str(duty_start)}，"
+                f"休息仅 {rest_hours:.1f}h < 10h"
+            )
+
+    # ---- 组装完整航段列表 ----
+    segments = []
+    for f in reg_flights:
+        segments.append({
+            "date": f["date"],
+            "dep_city": f["dep_city"],
+            "dep_time": f["dep_time"],
+            "arr_time": f["arr_time"],
+            "arr_city": f["arr_city"],
+            "is_ferry": f["is_ferry"],
+            "is_new": False,
+            "is_ferry_leg": False,
+            "crew": f.get("crew", []),
         })
 
-    if not results:
-        return {"errors": [
-            f"⚠️ 无法为 {target_date.strftime('%m月%d日')} 的 {dep_city}（{dep_icao}）出发行程找到可行方案。",
-            "可能原因：",
-            "  · 没有飞机在计划内能及时赶到 " + dep_city,
-            "  · 缺少 " + dep_city + " 的坐标数据，无法估算调机时间",
-        ]}
+    if ferry_info and ferry_info["ferry_min"] > 0:
+        segments.append({
+            "date": target_date,
+            "dep_city": ferry_info["from_city"],
+            "dep_time": min_to_time_str(ferry_info["dep_min"]),
+            "arr_time": min_to_time_str(ferry_info["arr_min"]),
+            "arr_city": dep_city,
+            "is_ferry": True,
+            "is_new": False,
+            "is_ferry_leg": True,
+            "crew": day_flights[0].get("crew", []) if day_flights else (before[0].get("crew", []) if before else []),
+        })
 
-    # 排序：可行的在前
-    results.sort(key=lambda r: (
-        0 if (r["ok_duty"] and r["ok_flight"] and r["rest_ok"]) else 1,
-        r["new_duty_total"],
-    ))
+    segments.append({
+        "date": target_date,
+        "dep_city": dep_city,
+        "dep_time": min_to_time_str(main_dep_min),
+        "arr_time": min_to_time_str(main_arr_min),
+        "arr_city": arr_city,
+        "is_ferry": False,
+        "is_new": True,
+        "is_ferry_leg": False,
+        "crew": day_flights[0].get("crew", []) if day_flights else (before[0].get("crew", []) if before else []),
+    })
+
+    segments.sort(key=lambda x: (x["date"], time_str_to_min(x["dep_time"]) or 0))
 
     return {
-        "errors": [],
-        "date": target_date,
-        "route": (dep_city, arr_city),
-        "dep_icao": dep_icao,
-        "arr_icao": arr_icao,
-        "flight_min": flight_min,
-        "plan_min": plan_min,
+        "reg": reg,
+        "segments": segments,
+        "day_flights": day_flights,
+        "crew": day_flights[0].get("crew", []) if day_flights else (before[0].get("crew", []) if before else []),
+        "duty_start": duty_start,
+        "duty_end": duty_end,
+        "duty_total": duty_total,
+        "old_flight": old_flight,
+        "ferry_info": ferry_info,
         "transit": transit,
-        "results": results,
+        "main_dep": main_dep_min,
+        "main_arr": main_arr_min,
+        "new_duty_end": duty_end,
+        "new_duty_total": duty_total,
+        "new_flight_total": total_flight,
+        "ok_duty": duty_total <= DUTY_MAX_MIN,
+        "ok_flight": total_flight <= FLIGHT_MAX_MIN,
+        "rest_ok": rest_ok,
+        "rest_note": rest_note,
+        "plan_min": plan_min,
+        "flight_min": flight_min,
     }
 
 
 # ================================================================
 # UI
 # ================================================================
-col1, col2 = st.columns(2)
 
-with col1:
-    st.subheader("① 现有航班计划")
-    st.caption("粘贴当前航班计划（含机组代号），F 表示调机")
-    schedule_text = st.text_area(
-        "schedule", height=420, label_visibility="collapsed",
-        placeholder=(
-            "F\nB652Q 13:20 - 16:20\n澳门 - 北京大兴\n"
-            "P002,P068,P046,C036,M021\n\n..."
-        ),
-        key="schedule_input",
-    )
+st.subheader("① 现有航班计划")
+st.caption("粘贴当前航班计划（含机组代号），F 表示调机")
+schedule_text = st.text_area(
+    "schedule", height=300, label_visibility="collapsed",
+    placeholder=(
+        "F\nB652Q 13:20 - 16:20\n澳门 - 北京大兴\n"
+        "P002,P068,P046,C036,M021\n\n..."
+    ),
+    key="schedule_input",
+)
 
-with col2:
-    st.subheader("② 潜在行程请求")
-    st.caption("只写需求：日期 + 航线 + 飞行时间（如 `10.4 澳门-老挝万象 0158`）")
+# 解析出所有可选飞机
+all_regs = []
+if schedule_text.strip():
+    _flights_preview = parse_schedule(schedule_text)
+    all_regs = sorted(set(f["reg"] for f in _flights_preview))
+
+col_a, col_b = st.columns([1, 2])
+
+with col_a:
+    st.subheader("② 选择飞机")
+    if all_regs:
+        selected_reg = st.selectbox(
+            "选择飞机",
+            options=all_regs,
+            label_visibility="collapsed",
+            key="reg_select",
+        )
+    else:
+        st.info("请先粘贴航班计划")
+        selected_reg = None
+
+with col_b:
+    st.subheader("③ 潜在行程请求")
     request_text = st.text_area(
-        "request", height=420, label_visibility="collapsed",
+        "request", height=130, label_visibility="collapsed",
         placeholder=(
-            "例如：\n辛苦评估一下共享租赁计划：\n"
-            "10.4 澳门-老挝万象 0158\n还是明天 MLLIN 这波客人的行程"
+            "例如：\n"
+            "10.4 澳门-老挝万象 0158\n"
+            "起飞时间可以适当根据我们调配"
         ),
         key="request_input",
     )
-
-st.markdown("---")
 
 col_d, col_b = st.columns([1, 3])
 with col_d:
@@ -641,181 +634,153 @@ with col_b:
     st.write("")
     run = st.button("🚀 分析并推荐", type="primary", use_container_width=True)
 
+
+# ================================================================
+# 主流程
+# ================================================================
 if run:
     if not schedule_text.strip():
-        st.error("请粘贴航班计划")
+        st.error("请先粘贴航班计划")
+    elif not selected_reg:
+        st.error("请先选择飞机")
     elif not request_text.strip():
         st.error("请填写潜在行程请求")
     else:
         flights = parse_schedule(schedule_text)
         if not flights:
-            st.error("❌ 无法解析航班计划，请检查格式")
+            st.error("❌ 无法解析航班计划")
         else:
             flights = assign_dates(flights, start_date)
             request = parse_request(request_text)
-            result = analyze(flights, request)
 
-            if result.get("errors"):
-                errs = result["errors"]
-                if errs and errs[0] == "NO_CONTENT":
-                    st.error("❌ 右侧请求框没有有效需求描述")
-                    st.markdown(
-                        "看起来你把**航班计划**粘到了右边。请分开：\n\n"
-                        "📌 **左侧**：完整航班计划\n"
-                        "📌 **右侧**：需求描述，例如 `10.4 澳门-老挝万象 0158`"
-                    )
-                elif errs and errs[0] == "MISSING_FIELDS":
-                    st.error("❌ 需求描述中缺少以下信息：")
-                    for item in errs[1]:
-                        st.markdown(f"- {item}")
+            if request["no_content"]:
+                st.error("❌ 请求框没有有效内容")
+                st.stop()
+
+            missing = []
+            if not request["date"]:
+                missing.append("**日期**（如 `10.4`）")
+            if not request["route"]:
+                missing.append("**航线**（如 `澳门-老挝万象`）")
+            if not request["flight_min"]:
+                missing.append("**飞行时间**（如 `0158`）")
+            if missing:
+                st.error("❌ 需求描述中缺少：")
+                for item in missing:
+                    st.markdown(f"- {item}")
+                st.stop()
+
+            target_date = request["date"]
+            dep_city, arr_city = request["route"]
+            flight_min = request["flight_min"]
+            dep_icao = get_icao(dep_city)
+            arr_icao = get_icao(arr_city)
+            plan_min = plan_minutes(flight_min)
+            transit = transit_minutes(dep_icao) if dep_icao else 120
+
+            # ---- 顶部摘要 ----
+            st.subheader("📋 请求摘要")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("日期", str(target_date))
+            c2.metric("飞机", selected_reg)
+            c3.metric("航线", f"{dep_icao or dep_city} → {arr_icao or arr_city}")
+            c4.metric("飞行时间", min_to_dur_str(flight_min))
+            c5.metric("计划时间", min_to_dur_str(plan_min))
+            st.caption(
+                f"过站时间：**{min_to_dur_str(transit)}**"
+                f"（{'国内' if is_domestic(dep_icao) else '国际'}）"
+            )
+
+            st.markdown("---")
+
+            # ---- 分析该飞机 ----
+            res = analyze_aircraft(
+                flights, selected_reg, target_date,
+                dep_city, arr_city, flight_min, transit, plan_min,
+            )
+
+            if res.get("error"):
+                st.error(res["error"])
+                st.stop()
+
+            # ---- 标题 ----
+            ok_all = res["ok_duty"] and res["ok_flight"] and res["rest_ok"]
+            head_icon = "✅" if ok_all else "⚠️"
+            st.subheader(f"{head_icon} {selected_reg} 新增后的完整行程")
+
+            # ---- 紧凑格式 ----
+            def _compact_line(seg):
+                dep_hm = seg["dep_time"].replace(":", "")
+                arr_hm = seg["arr_time"].replace(":", "")
+                if seg.get("is_ferry_leg"):
+                    tag = "  调机"
+                elif seg.get("is_new"):
+                    tag = "  新增"
                 else:
-                    for e in errs:
-                        st.warning(e)
-            else:
-                st.subheader("📋 请求摘要")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("日期", str(result["date"]))
-                c2.metric("航线", f"{result['dep_icao']} → {result['arr_icao']}")
-                c3.metric("飞行时间", min_to_dur_str(result["flight_min"]))
-                c4.metric("计划时间", min_to_dur_str(result["plan_min"]))
-                st.caption(
-                    f"过站时间：**{min_to_dur_str(result['transit'])}**"
-                    f"（{'国内' if is_domestic(result['dep_icao']) else '国际'}）"
+                    tag = "  调机" if seg.get("is_ferry") else ""
+                return (
+                    f"{seg['date'].day}号 {seg['dep_city']}{dep_hm} "
+                    f"{arr_hm}{seg['arr_city']}{tag}"
                 )
 
-                st.markdown("---")
-                st.subheader("✈️ 候选方案")
+            compact_lines = [selected_reg]
+            for seg in res["segments"]:
+                compact_lines.append(_compact_line(seg))
+            st.code("\n".join(compact_lines), language=None)
 
-                out_lines = []
+            # ---- 调机信息 ----
+            if res["ferry_info"] and res["ferry_info"]["ferry_min"] > 0:
+                fi = res["ferry_info"]
+                st.markdown(
+                    f"**调机段：** `{min_to_time_str(fi['dep_min'])} - "
+                    f"{min_to_time_str(fi['arr_min'])}`  "
+                    f"{fi['from_city']} → {dep_city}  "
+                    f"（估算飞行 {min_to_dur_str(fi['ferry_min'])}）"
+                )
+                st.caption(
+                    f"飞机原计划 {fi['based_on']['date'].strftime('%m月%d日')} "
+                    f"{fi['based_on']['arr_time']} 到达 {fi['from_city']}"
+                )
 
-                def _seg_sort_key(seg):
-                    return (seg["date"], time_str_to_min(seg["dep_time"]) or 0)
+            # ---- 详细数据 ----
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(
+                    f"**当日现有值勤：** {min_to_time_str(res['duty_start'])} → "
+                    f"{min_to_time_str(res['duty_start'] + res['duty_total'])} "
+                    f"（{min_to_dur_str(res['duty_total'])}）"
+                )
+                st.markdown(f"**当日现有飞行：** {min_to_dur_str(res['old_flight'])}")
+                crew_str = ", ".join(res["crew"]) if res["crew"] else "—"
+                st.markdown(f"**机组：** `{crew_str}`")
+            with c2:
+                st.markdown(
+                    f"**推荐主段：** `{min_to_time_str(res['main_dep'])} - "
+                    f"{min_to_time_str(res['main_arr'])}`  "
+                    f"{dep_city} → {arr_city}"
+                )
+                st.markdown(
+                    f"**新增后值勤：** {min_to_time_str(res['duty_start'])} → "
+                    f"{min_to_time_str(res['new_duty_end'])} "
+                    f"（{min_to_dur_str(res['new_duty_total'])}）"
+                )
+                st.markdown(
+                    f"**新增后飞行：** {min_to_dur_str(res['new_flight_total'])}"
+                )
 
-                def _compact_line(seg):
-                    dep_hm = seg["dep_time"].replace(":", "")
-                    arr_hm = seg["arr_time"].replace(":", "")
-                    if seg.get("is_ferry_leg"):
-                        tag = "  ← 调机"
-                    elif seg.get("is_new"):
-                        tag = "  ← 推荐新增"
-                    else:
-                        tag = "  调机" if seg.get("is_ferry") else ""
-                    return (
-                        f"{seg['date'].day}号 {seg['dep_city']}{dep_hm} "
-                        f"{arr_hm}{seg['arr_city']}{tag}"
-                    )
+            checks = [
+                f"{'✅' if res['ok_duty'] else '❌'} 值勤 ≤ 14h"
+                f"（{min_to_dur_str(res['new_duty_total'])}）",
+                f"{'✅' if res['ok_flight'] else '❌'} 飞行 ≤ 10h"
+                f"（{min_to_dur_str(res['new_flight_total'])}）",
+                f"{'✅' if res['rest_ok'] else '❌'} 前日休息 ≥ 10h"
+                + (f"（{res['rest_note']}）" if res["rest_note"] else ""),
+            ]
+            for c in checks:
+                st.markdown(f"- {c}")
 
-                for r in result["results"]:
-                    reg = r["reg"]
-                    duty_start_str = min_to_time_str(r["duty_start"])
-                    duty_end_str = min_to_time_str(r["duty_end"])
-                    main_dep_str = min_to_time_str(r["main_dep"])
-                    main_arr_str = min_to_time_str(r["main_arr"])
-
-                    ok_all = r["ok_duty"] and r["ok_flight"] and r["rest_ok"]
-                    head_icon = "✅" if ok_all else "⚠️"
-
-                    # 组装完整航段列表（该飞机全部）
-                    all_of_reg = [f for f in flights if f["reg"] == reg]
-                    all_of_reg.sort(key=_seg_sort_key)
-
-                    all_segments = []
-                    for f in all_of_reg:
-                        all_segments.append({
-                            "date": f["date"], "dep_city": f["dep_city"],
-                            "dep_time": f["dep_time"], "arr_time": f["arr_time"],
-                            "arr_city": f["arr_city"], "is_ferry": f["is_ferry"],
-                            "is_new": False, "is_ferry_leg": False,
-                        })
-
-                    # 插入调机段
-                    if r["ferry_info"]:
-                        fi = r["ferry_info"]
-                        all_segments.append({
-                            "date": result["date"],
-                            "dep_city": fi["from_city"],
-                            "dep_time": min_to_time_str(fi["dep_min"]),
-                            "arr_time": min_to_time_str(fi["arr_min"]),
-                            "arr_city": result["route"][0],
-                            "is_ferry": False, "is_new": False,
-                            "is_ferry_leg": True,
-                        })
-
-                    # 插入主段
-                    all_segments.append({
-                        "date": result["date"],
-                        "dep_city": result["route"][0],
-                        "dep_time": main_dep_str,
-                        "arr_time": main_arr_str,
-                        "arr_city": result["route"][1],
-                        "is_ferry": False, "is_new": True, "is_ferry_leg": False,
-                    })
-                    all_segments.sort(key=_seg_sort_key)
-
-                    with st.container():
-                        st.markdown(f"### {head_icon} {reg}")
-
-                        st.markdown("**该飞机完整行程（紧凑格式）：**")
-                        compact_lines = [reg]
-                        for seg in all_segments:
-                            compact_lines.append(_compact_line(seg))
-                        st.code("\n".join(compact_lines), language=None)
-
-                        # 调机信息
-                        if r["ferry_info"]:
-                            fi = r["ferry_info"]
-                            last_seg = fi["from_seg"]
-                            st.markdown(
-                                f"**调机段：** `{min_to_time_str(fi['dep_min'])} - "
-                                f"{min_to_time_str(fi['arr_min'])}`  "
-                                f"{fi['from_city']} → {result['route'][0]}  "
-                                f"（估算飞行 {min_to_dur_str(fi['ferry_min'])}）"
-                            )
-                            st.caption(
-                                f"飞机当前位于 {fi['from_city']}"
-                                f"（{last_seg['date'].strftime('%m月%d日')} "
-                                f"{last_seg['arr_time']} 到达）"
-                            )
-
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            st.markdown(
-                                f"**当日现有值勤：** {duty_start_str} → {duty_end_str} "
-                                f"（{min_to_dur_str(r['duty_total'])}）"
-                            )
-                            st.markdown(f"**当日现有飞行：** {min_to_dur_str(r['old_flight'])}")
-                            crew_str = ", ".join(r["crew"]) if r["crew"] else "—"
-                            st.markdown(f"**机组：** `{crew_str}`")
-                        with c2:
-                            st.markdown(
-                                f"**推荐主段：** `{main_dep_str} - {main_arr_str}`  "
-                                f"{result['route'][0]} → {result['route'][1]}"
-                            )
-                            st.markdown(
-                                f"**新增后值勤：** {duty_start_str} → "
-                                f"{min_to_time_str(r['new_duty_end'])} "
-                                f"（{min_to_dur_str(r['new_duty_total'])}）"
-                            )
-                            st.markdown(
-                                f"**新增后飞行：** {min_to_dur_str(r['new_flight_total'])}"
-                            )
-
-                        checks = [
-                            f"{'✅' if r['ok_duty'] else '❌'} 值勤 ≤ 14h"
-                            f"（{min_to_dur_str(r['new_duty_total'])}）",
-                            f"{'✅' if r['ok_flight'] else '❌'} 飞行 ≤ 10h"
-                            f"（{min_to_dur_str(r['new_flight_total'])}）",
-                            f"{'✅' if r['rest_ok'] else '❌'} 前日休息 ≥ 10h"
-                            + (f"（{r['rest_note']}）" if r["rest_note"] else ""),
-                        ]
-                        for c in checks:
-                            st.markdown(f"- {c}")
-
-                        st.markdown("---")
-
-                    out_lines.extend(compact_lines)
-                    out_lines.append("")
-
-                st.subheader("📄 可复制方案")
-                st.caption("点右上角复制按钮，直接粘贴到 Jetops / 邮件 / 微信")
-                st.code("\n".join(out_lines).rstrip(), language=None)
+            # ---- 可复制方案 ----
+            st.markdown("---")
+            st.subheader("📄 可复制方案")
+            st.caption("点右上角复制按钮，直接粘贴到 Jetops / 邮件 / 微信")
+            st.code("\n".join(compact_lines), language=None)
