@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-航班行程安排助手（按飞机分别推断日期）
+航班行程安排助手（Excel 计划版）
+上传航段数据 Excel → 选择飞机 → 填需求 → 输出该飞机完整行程 + 新增段
 """
 
 import streamlit as st
 import re
+import io
 from math import radians, sin, cos, asin, sqrt
 from datetime import datetime, timedelta, date
+from openpyxl import load_workbook
 
 st.set_page_config(page_title="航班行程安排助手", page_icon="✈️", layout="wide")
 st.title("✈️ 航班行程安排助手")
-st.caption("粘贴计划 → 选择飞机 → 填需求 → 自动排出完整行程")
+st.caption("上传航段数据 Excel → 选择飞机 → 填需求 → 自动排出完整行程")
 
 
 # ================================================================
@@ -73,7 +76,7 @@ CITY_TO_ICAO = {
 def get_icao(city):
     if not city:
         return None
-    city = city.strip()
+    city = str(city).strip()
     if city in CITY_TO_ICAO:
         return CITY_TO_ICAO[city]
     for k, v in CITY_TO_ICAO.items():
@@ -162,11 +165,21 @@ def estimate_flight_minutes(from_icao, to_icao):
 # ================================================================
 # 时间工具
 # ================================================================
-def time_str_to_min(t):
-    m = re.match(r"^(\d{1,2}):(\d{2})$", str(t).strip())
-    if not m:
+def time_to_min(t):
+    """接受 datetime.time / datetime.datetime / 'HH:MM' 字符串"""
+    if t is None:
         return None
-    return int(m.group(1)) * 60 + int(m.group(2))
+    if isinstance(t, datetime):
+        return t.hour * 60 + t.minute
+    try:
+        if hasattr(t, "hour") and hasattr(t, "minute"):
+            return t.hour * 60 + t.minute
+    except Exception:
+        pass
+    m = re.match(r"^(\d{1,2}):(\d{2})$", str(t).strip())
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    return None
 
 
 def min_to_time_str(m):
@@ -190,135 +203,88 @@ def plan_minutes(flight_minutes):
 
 
 def is_domestic(icao):
-    return bool(icao) and icao.startswith("Z")
+    return bool(icao) and str(icao).startswith("Z")
 
 
 def transit_minutes(icao):
     return 90 if is_domestic(icao) else 120
 
 
+def to_date(v):
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = str(v).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
 # ================================================================
-# 解析航班计划
+# 解析 Excel 计划
 # ================================================================
-FLIGHT_HEADER_RE = re.compile(
-    r"^([A-Z0-9]+)\s+(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})(\s*\+1)?$"
-)
+def load_excel_plan(file_bytes):
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    ws = wb["航段(北京时)"] if "航段(北京时)" in wb.sheetnames else wb.active
 
-
-def parse_schedule(text):
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    flights = []
-    i = 0
-    pending_f = False
-
-    while i < len(lines):
-        line = lines[i]
-
-        if line.upper() == "F":
-            pending_f = True
-            i += 1
-            continue
-        if line.upper() == "TBA":
-            i += 1
+    rows = []
+    for r in range(3, ws.max_row + 1):
+        reg = ws.cell(r, 3).value
+        if not reg:
             continue
 
-        m = FLIGHT_HEADER_RE.match(line)
-        if m:
-            reg = m.group(1).upper()
-            dep_time = m.group(2)
-            arr_time = m.group(3)
-            plus1 = bool(m.group(4))
+        reg_str = str(reg).strip().upper()
 
-            if i + 1 < len(lines):
-                cm = re.match(r"^(.+?)\s+-\s+(.+)$", lines[i + 1])
-                if cm:
-                    dep_city = cm.group(1).strip()
-                    arr_city = cm.group(2).strip()
+        dep_date = to_date(ws.cell(r, 7).value)
+        arr_date = to_date(ws.cell(r, 15).value)
 
-                    crew = []
-                    step = 2
-                    if i + 2 < len(lines):
-                        cl = lines[i + 2].replace(" ", "")
-                        if re.match(r"^[A-Z0-9,]+$", cl):
-                            crew = [x for x in cl.split(",") if x]
-                            step = 3
+        dep_icao = str(ws.cell(r, 11).value or "").strip().upper()
+        dep_city = str(ws.cell(r, 12).value or "").strip()
+        arr_icao = str(ws.cell(r, 13).value or "").strip().upper()
+        arr_city = str(ws.cell(r, 14).value or "").strip()
 
-                    flights.append({
-                        "reg": reg,
-                        "dep_time": dep_time,
-                        "arr_time": arr_time,
-                        "dep_city": dep_city,
-                        "arr_city": arr_city,
-                        "crew": crew,
-                        "is_ferry": pending_f,
-                        "plus1": plus1,
-                    })
-                    pending_f = False
-                    i += step
-                    continue
-        i += 1
-    return flights
+        # 城市可能有多个机场名，取第一个
+        dep_city_clean = dep_city.split()[0] if dep_city else ""
+        arr_city_clean = arr_city.split()[0] if arr_city else ""
 
+        dep_min = time_to_min(ws.cell(r, 8).value)
+        arr_min = time_to_min(ws.cell(r, 16).value)
 
-def assign_dates(flights, start_date):
-    """按飞机分别推断日期：每架飞机内部独立计时，时间回退则新的一天"""
-    current_by_reg = {}
-    prev_min_by_reg = {}
-
-    for f in flights:
-        reg = f["reg"]
-        dm = time_str_to_min(f["dep_time"])
-        if dm is None:
+        if dep_min is None or arr_min is None or not dep_date:
             continue
 
-        if reg not in current_by_reg:
-            current_by_reg[reg] = start_date
-            prev_min_by_reg[reg] = None
+        # 若到达时间 < 出发时间，视为跨天（到达日期 +1）
+        arr_dt_date = arr_date or dep_date
+        if arr_date is None and arr_min < dep_min:
+            arr_dt_date = dep_date + timedelta(days=1)
 
-        if prev_min_by_reg[reg] is not None and dm < prev_min_by_reg[reg]:
-            current_by_reg[reg] += timedelta(days=1)
+        rows.append({
+            "reg": reg_str,
+            "use": str(ws.cell(r, 4).value or "").strip(),
+            "dep_date": dep_date,
+            "dep_min": dep_min,
+            "dep_icao": dep_icao,
+            "dep_city": dep_city_clean,
+            "arr_date": arr_dt_date,
+            "arr_min": arr_min,
+            "arr_icao": arr_icao,
+            "arr_city": arr_city_clean,
+        })
 
-        f["date"] = current_by_reg[reg]
-        prev_min_by_reg[reg] = dm
-
-    return flights
+    return rows
 
 
 # ================================================================
 # 解析需求
 # ================================================================
-def _is_schedule_line(s):
-    if not s:
-        return True
-    if s in ("F", "TBA"):
-        return True
-    if re.match(r"^[A-Z0-9]+\s+\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}", s):
-        return True
-    if len(s) > 3 and re.match(r"^[A-Z0-9,]+$", s):
-        return True
-    return False
-
-
 def parse_request(text):
-    raw_lines = text.splitlines()
-    keep = []
-    skip_city = False
-    for ln in raw_lines:
-        s = ln.strip()
-        if not s:
-            continue
-        if _is_schedule_line(s):
-            if re.match(r"^[A-Z0-9]+\s+\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}", s):
-                skip_city = True
-            continue
-        if skip_city and re.match(r"^[\u4e00-\u9fff\s]+\s*-\s*[\u4e00-\u9fff\s]+$", s):
-            skip_city = False
-            continue
-        skip_city = False
-        keep.append(s)
-
-    clean_text = "\n".join(keep)
-    no_content = not clean_text.strip()
+    clean_text = text
 
     target_date = None
     m = re.search(r"(\d{1,2})\s*[.\-/月]\s*(\d{1,2})\s*[日号]?", clean_text)
@@ -369,8 +335,9 @@ def parse_request(text):
                 flight_min = hh * 60 + mm
 
     return {
-        "date": target_date, "route": route, "flight_min": flight_min,
-        "raw": clean_text, "no_content": no_content,
+        "date": target_date,
+        "route": route,
+        "flight_min": flight_min,
     }
 
 
@@ -384,37 +351,35 @@ REST_MIN = 10 * 60
 
 def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
                      flight_min, transit, plan_min):
-    dep_icao = get_icao(dep_city)
-    arr_icao = get_icao(arr_city)
-    if not dep_icao:
+    dep_icao_req = get_icao(dep_city)
+    arr_icao_req = get_icao(arr_city)
+    if not dep_icao_req:
         return {"error": f"❌ 无法识别出发城市：{dep_city}"}
-    if not arr_icao:
+    if not arr_icao_req:
         return {"error": f"❌ 无法识别到达城市：{arr_city}"}
 
     reg_flights = [f for f in flights_all if f["reg"] == reg]
-    reg_flights.sort(key=lambda x: (x["date"], time_str_to_min(x["dep_time"]) or 0))
+    reg_flights.sort(key=lambda x: (x["dep_date"], x["dep_min"]))
 
-    before = [f for f in reg_flights if f["date"] <= target_date]
-    day_flights = [f for f in reg_flights if f["date"] == target_date]
-    day_flights.sort(key=lambda x: time_str_to_min(x["dep_time"]) or 0)
+    before = [f for f in reg_flights if f["dep_date"] <= target_date]
+    day_flights = [f for f in reg_flights if f["dep_date"] == target_date]
 
     if not before:
-        return {"error": f"❌ 所选飞机 {reg} 在 {target_date.strftime('%m月%d日')} 之前没有任何航段。"}
+        return {"error": f"❌ 飞机 {reg} 在 {target_date.strftime('%m月%d日')} 之前没有任何航段。"}
 
-    # ---- 调机需求 ----
+    # ---- 判断是否需要调机 ----
     ferry_info = None
     if day_flights:
         last_of_day = day_flights[-1]
-        if get_icao(last_of_day["arr_city"]) == dep_icao:
+        if last_of_day["arr_icao"] == dep_icao_req:
             ferry_info = None
         else:
+            ferry_from_icao = last_of_day["arr_icao"]
             ferry_from_city = last_of_day["arr_city"]
-            ferry_from_icao = get_icao(ferry_from_city)
-            ferry_min = estimate_flight_minutes(ferry_from_icao, dep_icao)
+            ferry_min = estimate_flight_minutes(ferry_from_icao, dep_icao_req)
             if ferry_min is None:
-                return {"error": f"❌ 缺少坐标数据，无法估算 {ferry_from_icao} → {dep_icao} 调机时间。"}
-            last_arr_min = time_str_to_min(last_of_day["arr_time"])
-            ferry_dep_min = last_arr_min + transit_minutes(ferry_from_icao)
+                return {"error": f"❌ 缺少坐标数据，无法估算 {ferry_from_icao} → {dep_icao_req} 调机时间。"}
+            ferry_dep_min = last_of_day["arr_min"] + transit_minutes(ferry_from_icao)
             ferry_plan_min = plan_minutes(ferry_min)
             ferry_arr_min = ferry_dep_min + ferry_plan_min
             ferry_info = {
@@ -428,13 +393,13 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
             }
     else:
         last_seg = before[-1]
-        last_city_icao = get_icao(last_seg["arr_city"])
-        if last_city_icao != dep_icao:
+        last_city_icao = last_seg["arr_icao"]
+        if last_city_icao != dep_icao_req:
             ferry_from_city = last_seg["arr_city"]
             ferry_from_icao = last_city_icao
-            ferry_min = estimate_flight_minutes(ferry_from_icao, dep_icao)
+            ferry_min = estimate_flight_minutes(ferry_from_icao, dep_icao_req)
             if ferry_min is None:
-                return {"error": f"❌ 缺少坐标数据，无法估算 {ferry_from_icao} → {dep_icao} 调机时间。"}
+                return {"error": f"❌ 缺少坐标数据，无法估算 {ferry_from_icao} → {dep_icao_req} 调机时间。"}
             ferry_dep_min = 8 * 60
             ferry_plan_min = plan_minutes(ferry_min)
             ferry_arr_min = ferry_dep_min + ferry_plan_min
@@ -452,7 +417,7 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
             ferry_arr_min = ferry_dep_min
             ferry_info = {
                 "from_city": dep_city,
-                "from_icao": dep_icao,
+                "from_icao": dep_icao_req,
                 "ferry_min": 0,
                 "ferry_plan_min": 0,
                 "dep_min": ferry_dep_min,
@@ -464,14 +429,13 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
     if ferry_info:
         main_dep_min = ferry_info["arr_min"] + transit
     else:
-        last_arr = time_str_to_min(day_flights[-1]["arr_time"])
-        main_dep_min = last_arr + transit
+        main_dep_min = day_flights[-1]["arr_min"] + transit
 
     main_arr_min = main_dep_min + plan_min
 
     # ---- 值勤时间 ----
     if day_flights:
-        duty_start = time_str_to_min(day_flights[0]["dep_time"]) - 120
+        duty_start = day_flights[0]["dep_min"] - 120
     elif ferry_info:
         duty_start = ferry_info["dep_min"] - 120
     else:
@@ -483,10 +447,11 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
     # ---- 飞行总时长 ----
     old_flight = 0
     for f in day_flights:
-        d = time_str_to_min(f["dep_time"])
-        a = time_str_to_min(f["arr_time"])
-        if d is not None and a is not None:
-            old_flight += (a - d) if a >= d else (a + 1440 - d)
+        d = f["dep_min"]
+        a = f["arr_min"]
+        if a < d:
+            a += 1440
+        old_flight += (a - d)
 
     ferry_flight = ferry_info["ferry_min"] if ferry_info else 0
     total_flight = old_flight + ferry_flight + flight_min
@@ -495,9 +460,9 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
     prev_day = target_date - timedelta(days=1)
     rest_ok = True
     rest_note = ""
-    prev_day_flights = [f for f in reg_flights if f["date"] == prev_day]
+    prev_day_flights = [f for f in reg_flights if f["dep_date"] == prev_day]
     if prev_day_flights:
-        prev_last_arr = time_str_to_min(prev_day_flights[-1]["arr_time"])
+        prev_last_arr = prev_day_flights[-1]["arr_min"]
         prev_duty_end = prev_last_arr + 60
         rest_hours = (duty_start - prev_duty_end) / 60
         if rest_hours < 10:
@@ -508,53 +473,47 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
                 f"休息仅 {rest_hours:.1f}h < 10h"
             )
 
-    # ---- 组装完整航段列表 ----
+    # ---- 组装航段 ----
     segments = []
     for f in reg_flights:
         segments.append({
-            "date": f["date"],
+            "date": f["dep_date"],
             "dep_city": f["dep_city"],
-            "dep_time": f["dep_time"],
-            "arr_time": f["arr_time"],
+            "dep_icao": f["dep_icao"],
+            "dep_time": min_to_time_str(f["dep_min"]),
+            "arr_time": min_to_time_str(f["arr_min"]),
             "arr_city": f["arr_city"],
-            "is_ferry": f["is_ferry"],
-            "is_new": False,
-            "is_ferry_leg": False,
-            "crew": f.get("crew", []),
+            "arr_icao": f["arr_icao"],
+            "tag": "",       # 无标记
         })
 
     if ferry_info and ferry_info["ferry_min"] > 0:
         segments.append({
             "date": target_date,
             "dep_city": ferry_info["from_city"],
+            "dep_icao": ferry_info["from_icao"],
             "dep_time": min_to_time_str(ferry_info["dep_min"]),
             "arr_time": min_to_time_str(ferry_info["arr_min"]),
             "arr_city": dep_city,
-            "is_ferry": True,
-            "is_new": False,
-            "is_ferry_leg": True,
-            "crew": day_flights[0].get("crew", []) if day_flights else (before[0].get("crew", []) if before else []),
+            "arr_icao": dep_icao_req,
+            "tag": "调机",
         })
 
     segments.append({
         "date": target_date,
         "dep_city": dep_city,
+        "dep_icao": dep_icao_req,
         "dep_time": min_to_time_str(main_dep_min),
         "arr_time": min_to_time_str(main_arr_min),
         "arr_city": arr_city,
-        "is_ferry": False,
-        "is_new": True,
-        "is_ferry_leg": False,
-        "crew": day_flights[0].get("crew", []) if day_flights else (before[0].get("crew", []) if before else []),
+        "arr_icao": arr_icao_req,
+        "tag": "新增",
     })
-
-    segments.sort(key=lambda x: (x["date"], time_str_to_min(x["dep_time"]) or 0))
 
     return {
         "reg": reg,
         "segments": segments,
         "day_flights": day_flights,
-        "crew": day_flights[0].get("crew", []) if day_flights else (before[0].get("crew", []) if before else []),
         "duty_start": duty_start,
         "duty_end": duty_end,
         "duty_total": duty_total,
@@ -579,18 +538,18 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
 # UI
 # ================================================================
 
-st.subheader("① 现有航班计划")
-st.caption("粘贴当前航班计划（含机组代号），F 表示调机")
-schedule_text = st.text_area(
-    "schedule", height=300, label_visibility="collapsed",
-    placeholder="F\nB652Q 13:20 - 16:20\n澳门 - 北京大兴\nP002,P068,P046,C036,M021\n\n...",
-    key="schedule_input",
+uploaded = st.file_uploader(
+    "① 上传航段数据导出 (.xlsx)", type=["xlsx"], key="xlsx_plan"
 )
 
+flights = []
 all_regs = []
-if schedule_text.strip():
-    _flights_preview = parse_schedule(schedule_text)
-    all_regs = sorted(set(f["reg"] for f in _flights_preview))
+if uploaded is not None:
+    try:
+        flights = load_excel_plan(uploaded.getvalue())
+        all_regs = sorted(set(f["reg"] for f in flights))
+    except Exception as e:
+        st.error(f"❌ 无法解析 Excel：{e}")
 
 col_a, col_b = st.columns([1, 2])
 
@@ -602,7 +561,7 @@ with col_a:
             label_visibility="collapsed", key="reg_select",
         )
     else:
-        st.info("请先粘贴航班计划")
+        st.info("请先上传 Excel")
         selected_reg = None
 
 with col_b:
@@ -613,152 +572,133 @@ with col_b:
         key="request_input",
     )
 
-col_d, col_b = st.columns([1, 3])
-with col_d:
-    start_date = st.date_input("计划第一天日期", value=date.today())
-with col_b:
-    st.write("")
-    st.write("")
-    run = st.button("🚀 分析并推荐", type="primary", use_container_width=True)
+st.write("")
+run = st.button("🚀 分析并推荐", type="primary", use_container_width=True)
 
 
 # ================================================================
 # 主流程
 # ================================================================
 if run:
-    if not schedule_text.strip():
-        st.error("请先粘贴航班计划")
-    elif not selected_reg:
-        st.error("请先选择飞机")
-    elif not request_text.strip():
+    if not flights:
+        st.error("请先上传航段数据 Excel")
+        st.stop()
+    if not selected_reg:
+        st.error("请选择飞机")
+        st.stop()
+    if not request_text.strip():
         st.error("请填写潜在行程请求")
-    else:
-        flights = parse_schedule(schedule_text)
-        if not flights:
-            st.error("❌ 无法解析航班计划")
-        else:
-            flights = assign_dates(flights, start_date)
-            request = parse_request(request_text)
+        st.stop()
 
-            if request["no_content"]:
-                st.error("❌ 请求框没有有效内容")
-                st.stop()
+    request = parse_request(request_text)
+    missing = []
+    if not request["date"]:
+        missing.append("**日期**（如 `10.4` 或 `10月4日`）")
+    if not request["route"]:
+        missing.append("**航线**（如 `澳门-老挝万象`）")
+    if not request["flight_min"]:
+        missing.append("**飞行时间**（如 `0158`、`1h58m`）")
+    if missing:
+        st.error("❌ 需求描述中缺少：")
+        for item in missing:
+            st.markdown(f"- {item}")
+        st.stop()
 
-            missing = []
-            if not request["date"]:
-                missing.append("**日期**（如 `10.4`）")
-            if not request["route"]:
-                missing.append("**航线**（如 `澳门-老挝万象`）")
-            if not request["flight_min"]:
-                missing.append("**飞行时间**（如 `0158`）")
-            if missing:
-                st.error("❌ 需求描述中缺少：")
-                for item in missing:
-                    st.markdown(f"- {item}")
-                st.stop()
+    target_date = request["date"]
+    dep_city, arr_city = request["route"]
+    flight_min = request["flight_min"]
+    dep_icao = get_icao(dep_city)
+    arr_icao = get_icao(arr_city)
+    plan_min = plan_minutes(flight_min)
+    transit = transit_minutes(dep_icao) if dep_icao else 120
 
-            target_date = request["date"]
-            dep_city, arr_city = request["route"]
-            flight_min = request["flight_min"]
-            dep_icao = get_icao(dep_city)
-            arr_icao = get_icao(arr_city)
-            plan_min = plan_minutes(flight_min)
-            transit = transit_minutes(dep_icao) if dep_icao else 120
+    st.subheader("📋 请求摘要")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("日期", str(target_date))
+    c2.metric("飞机", selected_reg)
+    c3.metric("航线", f"{dep_icao or dep_city} → {arr_icao or arr_city}")
+    c4.metric("飞行时间", min_to_dur_str(flight_min))
+    c5.metric("计划时间", min_to_dur_str(plan_min))
+    st.caption(
+        f"过站时间：**{min_to_dur_str(transit)}**"
+        f"（{'国内' if is_domestic(dep_icao) else '国际'}）"
+    )
 
-            st.subheader("📋 请求摘要")
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("日期", str(target_date))
-            c2.metric("飞机", selected_reg)
-            c3.metric("航线", f"{dep_icao or dep_city} → {arr_icao or arr_city}")
-            c4.metric("飞行时间", min_to_dur_str(flight_min))
-            c5.metric("计划时间", min_to_dur_str(plan_min))
-            st.caption(
-                f"过站时间：**{min_to_dur_str(transit)}**"
-                f"（{'国内' if is_domestic(dep_icao) else '国际'}）"
-            )
+    st.markdown("---")
 
-            st.markdown("---")
+    res = analyze_aircraft(
+        flights, selected_reg, target_date,
+        dep_city, arr_city, flight_min, transit, plan_min,
+    )
 
-            res = analyze_aircraft(
-                flights, selected_reg, target_date,
-                dep_city, arr_city, flight_min, transit, plan_min,
-            )
+    if res.get("error"):
+        st.error(res["error"])
+        st.stop()
 
-            if res.get("error"):
-                st.error(res["error"])
-                st.stop()
+    ok_all = res["ok_duty"] and res["ok_flight"] and res["rest_ok"]
+    head_icon = "✅" if ok_all else "⚠️"
+    st.subheader(f"{head_icon} {selected_reg} 新增后的完整行程")
 
-            ok_all = res["ok_duty"] and res["ok_flight"] and res["rest_ok"]
-            head_icon = "✅" if ok_all else "⚠️"
-            st.subheader(f"{head_icon} {selected_reg} 新增后的完整行程")
+    def _compact_line(seg):
+        dep_hm = seg["dep_time"].replace(":", "")
+        arr_hm = seg["arr_time"].replace(":", "")
+        tag = f"  {seg['tag']}" if seg.get("tag") else ""
+        return (
+            f"{seg['date'].day}号 {seg['dep_city']}{dep_hm} "
+            f"{arr_hm}{seg['arr_city']}{tag}"
+        )
 
-            def _compact_line(seg):
-                dep_hm = seg["dep_time"].replace(":", "")
-                arr_hm = seg["arr_time"].replace(":", "")
-                if seg.get("is_ferry_leg"):
-                    tag = "  调机"
-                elif seg.get("is_new"):
-                    tag = "  新增"
-                else:
-                    tag = "  调机" if seg.get("is_ferry") else ""
-                return (
-                    f"{seg['date'].day}号 {seg['dep_city']}{dep_hm} "
-                    f"{arr_hm}{seg['arr_city']}{tag}"
-                )
+    compact_lines = [selected_reg]
+    for seg in res["segments"]:
+        compact_lines.append(_compact_line(seg))
+    st.code("\n".join(compact_lines), language=None)
 
-            compact_lines = [selected_reg]
-            for seg in res["segments"]:
-                compact_lines.append(_compact_line(seg))
-            st.code("\n".join(compact_lines), language=None)
+    if res["ferry_info"] and res["ferry_info"]["ferry_min"] > 0:
+        fi = res["ferry_info"]
+        st.markdown(
+            f"**调机段：** `{min_to_time_str(fi['dep_min'])} - "
+            f"{min_to_time_str(fi['arr_min'])}`  "
+            f"{fi['from_city']} → {dep_city}  "
+            f"（估算飞行 {min_to_dur_str(fi['ferry_min'])}）"
+        )
+        st.caption(
+            f"飞机原计划 {fi['based_on']['dep_date'].strftime('%m月%d日')} "
+            f"{min_to_time_str(fi['based_on']['arr_min'])} 到达 {fi['from_city']}"
+        )
 
-            if res["ferry_info"] and res["ferry_info"]["ferry_min"] > 0:
-                fi = res["ferry_info"]
-                st.markdown(
-                    f"**调机段：** `{min_to_time_str(fi['dep_min'])} - "
-                    f"{min_to_time_str(fi['arr_min'])}`  "
-                    f"{fi['from_city']} → {dep_city}  "
-                    f"（估算飞行 {min_to_dur_str(fi['ferry_min'])}）"
-                )
-                st.caption(
-                    f"飞机原计划 {fi['based_on']['date'].strftime('%m月%d日')} "
-                    f"{fi['based_on']['arr_time']} 到达 {fi['from_city']}"
-                )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(
+            f"**当日现有值勤：** {min_to_time_str(res['duty_start'])} → "
+            f"{min_to_time_str(res['duty_start'] + res['duty_total'])} "
+            f"（{min_to_dur_str(res['duty_total'])}）"
+        )
+        st.markdown(f"**当日现有飞行：** {min_to_dur_str(res['old_flight'])}")
+    with c2:
+        st.markdown(
+            f"**推荐主段：** `{min_to_time_str(res['main_dep'])} - "
+            f"{min_to_time_str(res['main_arr'])}`  "
+            f"{dep_city} → {arr_city}"
+        )
+        st.markdown(
+            f"**新增后值勤：** {min_to_time_str(res['duty_start'])} → "
+            f"{min_to_time_str(res['new_duty_end'])} "
+            f"（{min_to_dur_str(res['new_duty_total'])}）"
+        )
+        st.markdown(f"**新增后飞行：** {min_to_dur_str(res['new_flight_total'])}")
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown(
-                    f"**当日现有值勤：** {min_to_time_str(res['duty_start'])} → "
-                    f"{min_to_time_str(res['duty_start'] + res['duty_total'])} "
-                    f"（{min_to_dur_str(res['duty_total'])}）"
-                )
-                st.markdown(f"**当日现有飞行：** {min_to_dur_str(res['old_flight'])}")
-                crew_str = ", ".join(res["crew"]) if res["crew"] else "—"
-                st.markdown(f"**机组：** `{crew_str}`")
-            with c2:
-                st.markdown(
-                    f"**推荐主段：** `{min_to_time_str(res['main_dep'])} - "
-                    f"{min_to_time_str(res['main_arr'])}`  "
-                    f"{dep_city} → {arr_city}"
-                )
-                st.markdown(
-                    f"**新增后值勤：** {min_to_time_str(res['duty_start'])} → "
-                    f"{min_to_time_str(res['new_duty_end'])} "
-                    f"（{min_to_dur_str(res['new_duty_total'])}）"
-                )
-                st.markdown(f"**新增后飞行：** {min_to_dur_str(res['new_flight_total'])}")
+    checks = [
+        f"{'✅' if res['ok_duty'] else '❌'} 值勤 ≤ 14h"
+        f"（{min_to_dur_str(res['new_duty_total'])}）",
+        f"{'✅' if res['ok_flight'] else '❌'} 飞行 ≤ 10h"
+        f"（{min_to_dur_str(res['new_flight_total'])}）",
+        f"{'✅' if res['rest_ok'] else '❌'} 前日休息 ≥ 10h"
+        + (f"（{res['rest_note']}）" if res["rest_note"] else ""),
+    ]
+    for c in checks:
+        st.markdown(f"- {c}")
 
-            checks = [
-                f"{'✅' if res['ok_duty'] else '❌'} 值勤 ≤ 14h"
-                f"（{min_to_dur_str(res['new_duty_total'])}）",
-                f"{'✅' if res['ok_flight'] else '❌'} 飞行 ≤ 10h"
-                f"（{min_to_dur_str(res['new_flight_total'])}）",
-                f"{'✅' if res['rest_ok'] else '❌'} 前日休息 ≥ 10h"
-                + (f"（{res['rest_note']}）" if res["rest_note"] else ""),
-            ]
-            for c in checks:
-                st.markdown(f"- {c}")
-
-            st.markdown("---")
-            st.subheader("📄 可复制方案")
-            st.caption("点右上角复制按钮，直接粘贴到 Jetops / 邮件 / 微信")
-            st.code("\n".join(compact_lines), language=None)
+    st.markdown("---")
+    st.subheader("📄 可复制方案")
+    st.caption("点右上角复制按钮，直接粘贴到 Jetops / 邮件 / 微信")
+    st.code("\n".join(compact_lines), language=None)
