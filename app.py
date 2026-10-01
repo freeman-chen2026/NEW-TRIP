@@ -206,9 +206,46 @@ def assign_dates(flights, start_date):
 # ================================================================
 # 解析潜在行程请求
 # ================================================================
+def _is_schedule_line(s):
+    """判断一行是否像航班计划（用于请求框里过滤误粘的计划）"""
+    if not s:
+        return True
+    if s in ("F", "TBA"):
+        return True
+    # 航班头：XXX HH:MM - HH:MM
+    if re.match(r"^[A-Z0-9]+\s+\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}", s):
+        return True
+    # 机组行：全是 P/C/M/W/数字/逗号，且较长
+    if len(s) > 3 and re.match(r"^[A-Z0-9,]+$", s):
+        return True
+    return False
+
+
 def parse_request(text):
+    # ---- 先过滤掉误粘的航班计划行 ----
+    raw_lines = text.splitlines()
+    keep = []
+    skip_city = False
+    for ln in raw_lines:
+        s = ln.strip()
+        if not s:
+            continue
+        if _is_schedule_line(s):
+            # 航班头后跟一行城市，也要跳过
+            if re.match(r"^[A-Z0-9]+\s+\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}", s):
+                skip_city = True
+            continue
+        if skip_city and re.match(r"^[\u4e00-\u9fff\s]+\s*-\s*[\u4e00-\u9fff\s]+$", s):
+            skip_city = False
+            continue
+        skip_city = False
+        keep.append(s)
+
+    clean_text = "\n".join(keep)
+
+    # ---- 日期 ----
     target_date = None
-    m = re.search(r"(\d{1,2})\s*[.\-/月]\s*(\d{1,2})", text)
+    m = re.search(r"(\d{1,2})\s*[.\-/月]\s*(\d{1,2})", clean_text)
     if m:
         mon, day = int(m.group(1)), int(m.group(2))
         year = datetime.now().year
@@ -217,25 +254,28 @@ def parse_request(text):
         except Exception:
             pass
 
+    # ---- 航线 ----
     route = None
     m = re.search(
         r"([\u4e00-\u9fff][\u4e00-\u9fff\s]{1,30}?)\s*[-–—到至]\s*"
         r"([\u4e00-\u9fff][\u4e00-\u9fff\s]{1,30})",
-        text,
+        clean_text,
     )
     if m:
         route = (m.group(1).strip(), m.group(2).strip())
 
+    # ---- 飞行时间：HHMM ----
     flight_min = None
-    candidates = re.findall(r"(?<!\d)(\d{4})(?!\d)", text)
+    candidates = re.findall(r"(?<!\d)(\d{4})(?!\d)", clean_text)
     for c in candidates:
         hh, mm = int(c[:2]), int(c[2:])
         if hh < 24 and mm < 60:
             flight_min = hh * 60 + mm
             break
 
+    # ---- 注册号（可选）----
     reg = None
-    m = re.search(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{3,7})(?![A-Za-z0-9])", text)
+    m = re.search(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{3,7})(?![A-Za-z0-9])", clean_text)
     if m:
         reg = m.group(1)
 
@@ -244,9 +284,8 @@ def parse_request(text):
         "route": route,
         "flight_min": flight_min,
         "reg": reg,
-        "raw": text,
+        "raw": clean_text,
     }
-
 
 # ================================================================
 # 分析
