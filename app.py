@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 航班行程安排助手（Excel 计划版）
-上传航段数据 Excel → 选择飞机 → 填需求 → 输出该飞机完整行程 + 新增段
 """
 
 import streamlit as st
@@ -166,7 +165,6 @@ def estimate_flight_minutes(from_icao, to_icao):
 # 时间工具
 # ================================================================
 def time_to_min(t):
-    """接受 datetime.time / datetime.datetime / 'HH:MM' 字符串"""
     if t is None:
         return None
     if isinstance(t, datetime):
@@ -249,7 +247,6 @@ def load_excel_plan(file_bytes):
         arr_icao = str(ws.cell(r, 13).value or "").strip().upper()
         arr_city = str(ws.cell(r, 14).value or "").strip()
 
-        # 城市可能有多个机场名，取第一个
         dep_city_clean = dep_city.split()[0] if dep_city else ""
         arr_city_clean = arr_city.split()[0] if arr_city else ""
 
@@ -259,7 +256,6 @@ def load_excel_plan(file_bytes):
         if dep_min is None or arr_min is None or not dep_date:
             continue
 
-        # 若到达时间 < 出发时间，视为跨天（到达日期 +1）
         arr_dt_date = arr_date or dep_date
         if arr_date is None and arr_min < dep_min:
             arr_dt_date = dep_date + timedelta(days=1)
@@ -473,42 +469,52 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
                 f"休息仅 {rest_hours:.1f}h < 10h"
             )
 
-    # ---- 组装航段 ----
+    # ---- 组装航段（原计划全部，按日期+时间排序）----
     segments = []
     for f in reg_flights:
         segments.append({
             "date": f["dep_date"],
             "dep_city": f["dep_city"],
             "dep_icao": f["dep_icao"],
-            "dep_time": min_to_time_str(f["dep_min"]),
-            "arr_time": min_to_time_str(f["arr_min"]),
+            "dep_min": f["dep_min"],
+            "arr_min": f["arr_min"],
             "arr_city": f["arr_city"],
             "arr_icao": f["arr_icao"],
-            "tag": "",       # 无标记
+            "tag": "",
         })
 
+    # 调机段：日期 = target_date，时间戳可能 > 1440
     if ferry_info and ferry_info["ferry_min"] > 0:
         segments.append({
             "date": target_date,
             "dep_city": ferry_info["from_city"],
             "dep_icao": ferry_info["from_icao"],
-            "dep_time": min_to_time_str(ferry_info["dep_min"]),
-            "arr_time": min_to_time_str(ferry_info["arr_min"]),
+            "dep_min": ferry_info["dep_min"],
+            "arr_min": ferry_info["arr_min"],
             "arr_city": dep_city,
             "arr_icao": dep_icao_req,
             "tag": "调机",
         })
 
+    # 主段：日期 = target_date，时间戳可能 > 1440（次日凌晨出发）
     segments.append({
         "date": target_date,
         "dep_city": dep_city,
         "dep_icao": dep_icao_req,
-        "dep_time": min_to_time_str(main_dep_min),
-        "arr_time": min_to_time_str(main_arr_min),
+        "dep_min": main_dep_min,
+        "arr_min": main_arr_min,
         "arr_city": arr_city,
         "arr_icao": arr_icao_req,
         "tag": "新增",
     })
+
+    # 全局按 (date, dep_min) 排序
+    segments.sort(key=lambda x: (x["date"], x["dep_min"]))
+
+    # 只保留 target_date ± 1 天的段
+    min_date = target_date - timedelta(days=1)
+    max_date = target_date + timedelta(days=1)
+    segments = [s for s in segments if min_date <= s["date"] <= max_date]
 
     return {
         "reg": reg,
@@ -640,8 +646,8 @@ if run:
     st.subheader(f"{head_icon} {selected_reg} 新增后的完整行程")
 
     def _compact_line(seg):
-        dep_hm = seg["dep_time"].replace(":", "")
-        arr_hm = seg["arr_time"].replace(":", "")
+        dep_hm = min_to_time_str(seg["dep_min"]).replace(":", "")
+        arr_hm = min_to_time_str(seg["arr_min"]).replace(":", "")
         tag = f"  {seg['tag']}" if seg.get("tag") else ""
         return (
             f"{seg['date'].day}号 {seg['dep_city']}{dep_hm} "
