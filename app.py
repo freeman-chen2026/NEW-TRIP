@@ -39,6 +39,7 @@ CITY_TO_ICAO = {
     "桂林两江": "ZGKL", "哈尔滨太平": "ZYHB",
     "长春龙嘉": "ZYCC", "台中清泉岗": "RCMQ",
     "越南岘港": "VVDN", "柬埔寨金边 德崇": "VDTI",
+    "柬埔寨金边": "VDTI",
     "老挝万象": "VLVT", "瓦岱": "VLVT",
     "日本东京 羽田": "RJTT", "日本东京 成田": "RJAA",
     "日本大阪 关西": "RJBB", "日本那霸": "ROAH",
@@ -67,7 +68,6 @@ CITY_TO_ICAO = {
     "玻利维亚乌尤尼": "SLUY", "智利伊基克": "SCDA",
     "智利卡拉马": "SCCF", "秘鲁利马": "SPJC",
     "巴哈马拿骚": "MYNN",
-    "柬埔寨金边": "VDTI",
 }
 
 
@@ -286,7 +286,6 @@ def analyze(flights, request):
         key = (f["date"], f["reg"])
         by_date_reg.setdefault(key, []).append(f)
 
-    # 找出当天最后一段到达 dep_icao 的飞机
     candidates = []
     for (d, reg), day_flights in by_date_reg.items():
         if d != target_date:
@@ -296,7 +295,6 @@ def analyze(flights, request):
         if last_arr_icao == dep_icao:
             candidates.append((reg, day_sorted))
 
-    # 若用户指定了注册号，只保留它
     if request["reg"]:
         specific = [c for c in candidates if c[0] == request["reg"]]
         if specific:
@@ -339,7 +337,6 @@ def analyze(flights, request):
         ok_duty = new_duty_total <= DUTY_MAX_MIN
         ok_flight = new_flight_total <= FLIGHT_MAX_MIN
 
-        # 检查休息时间
         prev_day = target_date - timedelta(days=1)
         rest_ok = True
         rest_note = ""
@@ -348,7 +345,6 @@ def analyze(flights, request):
                 prev_sorted = sorted(prev_flights, key=lambda x: time_str_to_min(x["dep_time"]))
                 prev_last_arr = time_str_to_min(prev_sorted[-1]["arr_time"])
                 prev_duty_end = prev_last_arr + 60
-                # 休息 = 今日值勤开始 - 前日值勤结束
                 rest_hours = (duty_start - prev_duty_end) / 60
                 if rest_hours < 10:
                     rest_ok = False
@@ -478,7 +474,7 @@ if run:
                     f"（{'国内' if is_domestic(result['dep_icao']) else '国际'}）"
                 )
 
-                              st.markdown("---")
+                st.markdown("---")
                 st.subheader("✈️ 候选飞机分析")
 
                 out_lines = []
@@ -490,9 +486,10 @@ if run:
                     dep_hm = seg["dep_time"].replace(":", "")
                     arr_hm = seg["arr_time"].replace(":", "")
                     ferry = "  调机" if seg.get("is_ferry") else ""
+                    new_tag = "  ← 推荐新增" if seg.get("is_new") else ""
                     return (
                         f"{seg['date'].day}号 {seg['dep_city']}{dep_hm} "
-                        f"{arr_hm}{seg['arr_city']}{ferry}"
+                        f"{arr_hm}{seg['arr_city']}{ferry}{new_tag}"
                     )
 
                 for r in result["results"]:
@@ -506,9 +503,12 @@ if run:
                     ok_all = r["ok_duty"] and r["ok_flight"] and r["rest_ok"]
                     head_icon = "✅" if ok_all else "⚠️"
 
-                    # 合并现有航段 + 推荐新段
+                    # ---- 该飞机在计划中所有航段 ----
+                    all_of_reg = [f for f in flights if f["reg"] == reg]
+                    all_of_reg.sort(key=_seg_sort_key)
+
                     all_segments = []
-                    for f in r["day_flights"]:
+                    for f in all_of_reg:
                         all_segments.append({
                             "date": f["date"],
                             "dep_city": f["dep_city"],
@@ -519,7 +519,7 @@ if run:
                             "is_new": False,
                         })
 
-                    # 新推荐段（若到达时间跨天，arr_date + 1）
+                    # ---- 插入新增段 ----
                     new_arr_min = r["earliest_arr"]
                     new_arr_date = result["date"]
                     if new_arr_min >= 1440:
@@ -539,14 +539,10 @@ if run:
                     with st.container():
                         st.markdown(f"### {head_icon} {reg}")
 
-                        # 紧凑格式预览
-                        st.markdown("**推荐行程（紧凑格式）：**")
+                        st.markdown("**该飞机完整行程（紧凑格式）：**")
                         compact_lines = [reg]
                         for seg in all_segments:
-                            line = _compact_line(seg)
-                            if seg["is_new"]:
-                                line += "   ← 推荐新增"
-                            compact_lines.append(line)
+                            compact_lines.append(_compact_line(seg))
                         st.code("\n".join(compact_lines), language=None)
 
                         crew_str = ", ".join(r["crew"]) if r["crew"] else "—"
@@ -606,7 +602,6 @@ if run:
 
                         st.markdown("---")
 
-                    # 写入可复制方案
                     out_lines.extend(compact_lines)
                     out_lines.append("")
 
