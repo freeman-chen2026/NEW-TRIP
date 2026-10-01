@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-航班行程安排助手（Excel 计划版 + 后续优化建议）
+航班行程安排助手（Excel 计划版 + 自动优化后续调机段）
 """
 
 import streamlit as st
@@ -349,66 +349,7 @@ def parse_request(text):
             if hh < 24 and mm < 60:
                 flight_min = hh * 60 + mm
 
-    return {
-        "date": target_date,
-        "route": route,
-        "flight_min": flight_min,
-    }
-
-
-# ================================================================
-# 后续优化建议
-# ================================================================
-def find_downstream_optimizations(flights_all, reg, landing_icao, landing_date, landing_min):
-    """
-    在新增段之后, 寻找可以优化的调机段:
-    若后续某调机段的出发地 != 新增段落地点, 但新增段落地点离该调机段目的地的距离
-    明显更近, 则建议取消该调机段, 改为从新增段落地点直接出发。
-    """
-    reg_flights = [f for f in flights_all if f["reg"] == reg]
-    reg_flights.sort(key=lambda x: (x["dep_date"], x["dep_min"]))
-
-    suggestions = []
-    for f in reg_flights:
-        # 只看新增段之后的段
-        if f["dep_date"] < landing_date:
-            continue
-        if f["dep_date"] == landing_date and f["dep_min"] <= landing_min:
-            continue
-
-        # 只处理调机段
-        if not is_ferry_use(f["use"]):
-            continue
-
-        # 如果调机段的出发地已经是新增段落地点, 不用优化
-        if f["dep_icao"] == landing_icao:
-            break
-
-        d_old = estimate_distance_km(f["dep_icao"], f["arr_icao"])
-        d_new = estimate_distance_km(landing_icao, f["arr_icao"])
-
-        if d_old is None or d_new is None:
-            continue
-
-        # 新路线至少省 15% 距离才提示
-        if d_new < d_old * 0.85:
-            saving_km = d_old - d_new
-            old_plan_min = plan_minutes(round(d_old / 800 * 60 + 25))
-            new_plan_min = plan_minutes(round(d_new / 800 * 60 + 25))
-            suggestions.append({
-                "original": f,
-                "landing_icao": landing_icao,
-                "landing_date": landing_date,
-                "d_old": d_old,
-                "d_new": d_new,
-                "saving_km": saving_km,
-                "old_plan_min": old_plan_min,
-                "new_plan_min": new_plan_min,
-            })
-
-        break  # 只看第一个调机段
-
-    return suggestions
+    return {"date": target_date, "route": route, "flight_min": flight_min}
 
 
 # ================================================================
@@ -540,7 +481,7 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
                 f"休息仅 {rest_hours:.1f}h < 10h"
             )
 
-    # ---- 组装航段 ----
+    # ---- 组装航段（原计划段 + 调机段 + 新增段）----
     segments = []
     for f in reg_flights:
         segments.append({
@@ -579,15 +520,73 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
 
     segments.sort(key=lambda x: (x["date"], x["dep_min"]))
 
+    # ====================================================
+    # 后续优化：新增段之后第一个调机段，若绕路则直接优化
+    # ====================================================
+    optimizations = []
+    for i, s in enumerate(segments):
+        # 只看新增段之后的段
+        if s["date"] < target_date:
+            continue
+        if s["date"] == target_date and s["dep_min"] <= main_arr_min:
+            continue
+        # 只处理调机段（原计划中的调机段，tag 为空）
+        if s["tag"] != "":
+            continue
+        # 检查该调机段是否绕路
+        orig_dep_icao = s["dep_icao"]
+        if orig_dep_icao == arr_icao_req:
+            break  # 出发地已经是新增段落地点，无需优化
+        d_old = estimate_distance_km(orig_dep_icao, s["arr_icao"])
+        d_new = estimate_distance_km(arr_icao_req, s["arr_icao"])
+        if d_old is None or d_new is None:
+            continue
+        if d_new >= d_old * 0.85:
+            continue  # 不够省
+
+        # 应用优化：改出发地为新增段落地点，保持出发日期和时间
+        new_flight_min = estimate_flight_minutes(arr_icao_req, s["arr_icao"])
+        new_plan_min = plan_minutes(new_flight_min)
+        old_dep_min = s["dep_min"]
+        old_arr_min = s["arr_min"]
+        new_arr_min = old_dep_min + new_plan_min
+
+        optimizations.append({
+            "date": s["date"],
+            "old_dep_city": s["dep_city"],
+            "old_dep_icao": orig_dep_icao,
+            "new_dep_city": icao_to_city(arr_icao_req),
+            "new_dep_icao": arr_icao_req,
+            "arr_city": s["arr_city"],
+            "arr_icao": s["arr_icao"],
+            "old_dep_time": min_to_time_str(old_dep_min),
+            "old_arr_time": min_to_time_str(old_arr_min),
+            "new_dep_time": min_to_time_str(old_dep_min),
+            "new_arr_time": min_to_time_str(new_arr_min),
+            "d_old": d_old,
+            "d_new": d_new,
+            "saving_km": d_old - d_new,
+            "old_plan_min": plan_minutes(round(d_old / 800 * 60 + 25)),
+            "new_plan_min": new_plan_min,
+        })
+
+        # 修改 segments 里的这一条
+        segments[i] = {
+            "date": s["date"],
+            "dep_city": icao_to_city(arr_icao_req),
+            "dep_icao": arr_icao_req,
+            "dep_min": old_dep_min,
+            "arr_min": new_arr_min,
+            "arr_city": s["arr_city"],
+            "arr_icao": s["arr_icao"],
+            "tag": "调机(优化)",
+        }
+        break  # 只优化第一个调机段
+
     # 只保留 target_date ± 1 天
     min_date = target_date - timedelta(days=1)
     max_date = target_date + timedelta(days=1)
     visible_segments = [s for s in segments if min_date <= s["date"] <= max_date]
-
-    # 后续优化建议
-    optimizations = find_downstream_optimizations(
-        flights_all, reg, arr_icao_req, target_date, main_arr_min
-    )
 
     return {
         "reg": reg,
@@ -746,6 +745,16 @@ if run:
             f"{min_to_time_str(fi['based_on']['arr_min'])} 到达 {fi['from_city']}"
         )
 
+    # ---- 优化提示 ----
+    if res.get("optimizations"):
+        for opt in res["optimizations"]:
+            st.info(
+                f"💡 已自动优化 {opt['date'].strftime('%m月%d日')} 的调机段："
+                f"原 `{opt['old_dep_city']} → {opt['arr_city']}`（{opt['d_old']} km），"
+                f"改为 `{opt['new_dep_city']} → {opt['arr_city']}`（{opt['d_new']} km），"
+                f"省 {opt['saving_km']} km、约 {min_to_dur_str(opt['old_plan_min'] - opt['new_plan_min'])}"
+            )
+
     c1, c2 = st.columns(2)
     with c1:
         st.markdown(
@@ -777,38 +786,6 @@ if run:
     ]
     for c in checks:
         st.markdown(f"- {c}")
-
-    # ===== 后续优化建议 =====
-    optimizations = res.get("optimizations", [])
-    if optimizations:
-        st.markdown("---")
-        st.subheader("💡 后续优化建议")
-        st.caption(
-            "由于新增段把飞机带到了新位置，原计划中要求飞机先回到某地再调机的段，"
-            "可以省掉一段。"
-        )
-        for opt in optimizations:
-            orig = opt["original"]
-            landing_city = icao_to_city(opt["landing_icao"])
-            new_from_city = landing_city
-            new_to_city = orig["arr_city"]
-            old_from_city = orig["dep_city"]
-
-            st.markdown(
-                f"**原计划 {orig['dep_date'].strftime('%m月%d日')} 的调机段：**"
-                f"`{orig['dep_city']} → {orig['arr_city']}`"
-                f"（{opt['d_old']} km，约 {min_to_dur_str(opt['old_plan_min'])}）"
-            )
-            st.markdown(
-                f"**改为从新增段落地点直接出发：**"
-                f"`{new_from_city} → {new_to_city}`"
-                f"（{opt['d_new']} km，约 {min_to_dur_str(opt['new_plan_min'])}）"
-            )
-            st.success(
-                f"可省 **{opt['saving_km']} km**，"
-                f"约 **{min_to_dur_str(opt['old_plan_min'] - opt['new_plan_min'])}**"
-                f"（机型巡航速度 800km/h）"
-            )
 
     st.markdown("---")
     st.subheader("📄 可复制方案")
