@@ -262,18 +262,27 @@ def parse_schedule(text):
 
 
 def assign_dates(flights, start_date):
-    current = start_date
-    prev_min = None
+    """按飞机分别推断日期：每架飞机内部独立计时，时间回退则新的一天"""
+    current_by_reg = {}
+    prev_min_by_reg = {}
+
     for f in flights:
+        reg = f["reg"]
         dm = time_str_to_min(f["dep_time"])
         if dm is None:
             continue
-        if prev_min is not None and dm < prev_min:
-            current += timedelta(days=1)
-        f["date"] = current
-        prev_min = dm
-    return flights
 
+        if reg not in current_by_reg:
+            current_by_reg[reg] = start_date
+            prev_min_by_reg[reg] = None
+
+        if prev_min_by_reg[reg] is not None and dm < prev_min_by_reg[reg]:
+            current_by_reg[reg] += timedelta(days=1)
+
+        f["date"] = current_by_reg[reg]
+        prev_min_by_reg[reg] = dm
+
+    return flights
 
 # ================================================================
 # 解析需求
