@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 航班行程安排助手（Excel 计划版 + 自动优化后续调机段 + 起飞时刻推荐
-              + 飞行时间自学习 + 多飞机自动选优）
+              + 飞行时间自学习 + 多飞机自动选优 + 原/新调机段标注）
 """
 
 import streamlit as st
@@ -157,7 +157,6 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def _airport_coord_fuzzy(icao):
-    """坐标缺失时的模糊兜底：同前缀（同国家/地区）找近似机场"""
     if icao in AIRPORT_COORDS:
         return AIRPORT_COORDS[icao]
     prefix = icao[:1] if icao else ""
@@ -274,6 +273,14 @@ def transit_minutes(icao):
     return 90 if is_domestic(icao) else 120
 
 
+def is_ferry_use(use_text):
+    """Excel 里用途列为调机/维修 → 视为原调机段"""
+    if not use_text:
+        return False
+    t = str(use_text)
+    return ("调机" in t) or ("维修" in t)
+
+
 def to_date(v):
     if v is None:
         return None
@@ -328,6 +335,7 @@ def load_excel_plan(file_bytes):
         if arr_date is None and arr_min < dep_min:
             arr_dt_date = dep_date + timedelta(days=1)
 
+        # 学习"预计飞行时间"（第 19 列）
         sched_min = time_to_min(ws.cell(r, 19).value)
         if sched_min and dep_icao and arr_icao and dep_icao != arr_icao:
             LEARNED_FLIGHT_MIN.setdefault((dep_icao, arr_icao), []).append(sched_min)
@@ -445,6 +453,10 @@ def parse_request(text):
 # ================================================================
 DUTY_MAX_MIN = 14 * 60
 FLIGHT_MAX_MIN = 10 * 60
+
+# 新增调机 & 优化调机标签（用于统计"因新需求产生的调机"）
+NEW_FERRY_TAGS = {"新增调机", "调机(优化)"}
+ORIG_FERRY_TAGS = {"原调机"}
 
 
 def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
@@ -588,8 +600,12 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
                 f"休息仅 {rest_hours:.1f}h < 10h"
             )
 
+    # ---- 组装航段（★ 原计划调机段自动打"原调机"标签）----
     segments = []
     for f in reg_flights:
+        tag = ""
+        if is_ferry_use(f.get("use", "")):
+            tag = "原调机"
         segments.append({
             "date": f["dep_date"],
             "dep_city": f["dep_city"],
@@ -598,7 +614,8 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
             "arr_min": f["arr_min"],
             "arr_city": f["arr_city"],
             "arr_icao": f["arr_icao"],
-            "tag": "",
+            "tag": tag,
+            "use": f.get("use", ""),
         })
 
     if ferry_info and ferry_info["ferry_min"] > 0:
@@ -612,7 +629,8 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
             "arr_min": fa_abs % 1440,
             "arr_city": dep_city,
             "arr_icao": dep_icao_req,
-            "tag": "调机",
+            "tag": "新增调机",
+            "use": "调机",
         })
 
     segments.append({
@@ -624,16 +642,23 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
         "arr_city": arr_city,
         "arr_icao": arr_icao_req,
         "tag": "新增",
+        "use": "",
     })
 
     segments.sort(key=lambda x: (x["date"], x["dep_min"]))
 
+    # ---- 后续优化：新需求之后的第一个非新增调机段（含原调机）----
     optimizations = []
     for i, s in enumerate(segments):
         seg_abs_dep = (s["date"] - target_date).days * 1440 + s["dep_min"]
         if seg_abs_dep <= main_arr_min:
             continue
-        if s["tag"] != "":
+        # 跳过新增段和已优化的段
+        if s["tag"] in ("新增", "新增调机", "调机(优化)"):
+            continue
+        # 只处理调机性质的段：原调机 tag 或 Excel 用途含调机
+        is_ferry_seg = (s["tag"] in ORIG_FERRY_TAGS) or is_ferry_use(s.get("use", ""))
+        if not is_ferry_seg:
             continue
 
         orig_dep_icao = s["dep_icao"]
@@ -656,6 +681,7 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
             "date": s["date"],
             "old_dep_city": s["dep_city"],
             "old_dep_icao": orig_dep_icao,
+            "old_tag": s["tag"] or "调机",
             "new_dep_city": icao_to_city(arr_icao_req),
             "new_dep_icao": arr_icao_req,
             "arr_city": s["arr_city"],
@@ -680,6 +706,7 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
             "arr_city": s["arr_city"],
             "arr_icao": s["arr_icao"],
             "tag": "调机(优化)",
+            "use": "调机",
         }
         break
 
@@ -796,35 +823,46 @@ def suggest_departure_times(flights_all, reg, target_date,
 
 
 # ================================================================
-# 多飞机对比：按"调机段数 → 调机时间 → 超时程度"排序
+# 多飞机对比：只统计"因新需求产生的调机段"
 # ================================================================
 def _compute_ferry_metrics(result):
     """
-    从 analyze_aircraft 的结果中提取"因新需求产生的调机段"：
-    - 只统计 tag 含"调机"的段（"调机" 或 "调机(优化)"）
-    - 原计划里的调机段（tag="") 不计入
+    只统计 tag ∈ {新增调机, 调机(优化)} 的段——即"因新需求产生的调机"
+    原计划里已有的调机段（tag = 原调机）不计入
     """
     ferry_count = 0
     ferry_total = 0
     for s in result["segments"]:
-        tag = s.get("tag", "")
-        if "调机" in tag:
-            ferry_count += 1
-            d = s["dep_min"]
-            a = s["arr_min"]
-            if a < d:
-                a += 1440
-            ferry_total += (a - d)
+        if s.get("tag") not in NEW_FERRY_TAGS:
+            continue
+        ferry_count += 1
+        d = s["dep_min"]
+        a = s["arr_min"]
+        if a < d:
+            a += 1440
+        ferry_total += (a - d)
     return ferry_count, ferry_total
+
+
+def _count_orig_ferry(result):
+    """统计原计划调机段数量 + 总时长，用于 UI 展示"""
+    cnt = 0
+    total = 0
+    for s in result["segments"]:
+        if s.get("tag") not in ORIG_FERRY_TAGS:
+            continue
+        cnt += 1
+        d = s["dep_min"]
+        a = s["arr_min"]
+        if a < d:
+            a += 1440
+        total += (a - d)
+    return cnt, total
 
 
 def rank_aircraft_for_request(flights_all, all_regs, target_date,
                               dep_city, arr_city, flight_min,
                               relax=True):
-    """
-    遍历所有飞机，返回按以下优先级排序的候选列表：
-      ① 合规（可放宽）→ ② 调机段数少 → ③ 调机时间短 → ④ 超时程度小
-    """
     dep_icao = get_icao(dep_city)
     arr_icao = get_icao(arr_city)
     if not dep_icao or not arr_icao:
@@ -843,7 +881,8 @@ def rank_aircraft_for_request(flights_all, all_regs, target_date,
             candidates.append({"reg": reg, "error": res["error"]})
             continue
 
-        fc, ft = _compute_ferry_metrics(res)
+        fc, ft = _compute_ferry_metrics(res)       # 新需求产生的调机
+        ofc, oft = _count_orig_ferry(res)          # 原计划已有的调机
         ok_all = res["ok_duty"] and res["ok_flight"] and res["rest_ok"]
         over = (
             max(0, res["new_duty_total"] - DUTY_MAX_MIN) * 2
@@ -853,8 +892,10 @@ def rank_aircraft_for_request(flights_all, all_regs, target_date,
         candidates.append({
             "reg": reg,
             "result": res,
-            "ferry_count": fc,
-            "ferry_min": ft,
+            "ferry_count": fc,           # 新增调机段数
+            "ferry_min": ft,             # 新增调机分钟
+            "orig_ferry_count": ofc,     # 原调机段数
+            "orig_ferry_min": oft,       # 原调机分钟
             "duty_total": res["new_duty_total"],
             "ok_all": ok_all,
             "over": over,
@@ -864,9 +905,9 @@ def rank_aircraft_for_request(flights_all, all_regs, target_date,
         if "error" in c:
             return (1, 999, 999999, 999999)
         return (
-            0 if c["ok_all"] else 1,   # 合规优先（放宽模式下也生效）
-            c["ferry_count"],           # ① 调机段数（少者优先）
-            c["ferry_min"],             # ② 调机时间（短者优先）
+            0 if c["ok_all"] else 1,   # 合规优先
+            c["ferry_count"],           # ① 新增调机段数（少者优先）
+            c["ferry_min"],             # ② 新增调机时间（短者优先）
             c["over"],                  # ③ 超时程度
         )
 
@@ -936,7 +977,7 @@ run = st.button("🚀 分析并推荐", type="primary", use_container_width=True
 
 
 # ================================================================
-# 结果渲染（单飞机 / 自动选优 复用）
+# 结果渲染
 # ================================================================
 def render_result(res, reg, dep_city, arr_city, relaxed=False):
     ok_all = res["ok_duty"] and res["ok_flight"] and res["rest_ok"]
@@ -957,10 +998,31 @@ def render_result(res, reg, dep_city, arr_city, relaxed=False):
         compact_lines.append(_compact_line(seg))
     st.code("\n".join(compact_lines), language=None)
 
+    # 调机段统计小卡片
+    fc, ft = _compute_ferry_metrics(res)
+    ofc, oft = _count_orig_ferry(res)
+    m1, m2 = st.columns(2)
+    with m1:
+        if fc:
+            st.markdown(
+                f"**新增调机：** {fc} 段 ／ {min_to_dur_str(ft)} "
+                f"（来自新需求）"
+            )
+        else:
+            st.markdown("**新增调机：** 无 ✅（飞机已在出发地）")
+    with m2:
+        if ofc:
+            st.markdown(
+                f"**原计划调机：** {ofc} 段 ／ {min_to_dur_str(oft)} "
+                f"（来自 Excel）"
+            )
+        else:
+            st.markdown("**原计划调机：** 无")
+
     if res["ferry_info"] and res["ferry_info"]["ferry_min"] > 0:
         fi = res["ferry_info"]
         st.markdown(
-            f"**调机段：** `{min_to_time_str(fi['dep_min'])} - "
+            f"**新增调机段：** `{min_to_time_str(fi['dep_min'])} - "
             f"{min_to_time_str(fi['arr_min'])}`  "
             f"{fi['from_city']} → {dep_city}  "
             f"（估算飞行 {min_to_dur_str(fi['ferry_min'])}）"
@@ -969,14 +1031,13 @@ def render_result(res, reg, dep_city, arr_city, relaxed=False):
             f"飞机原计划 {fi['based_on']['dep_date'].strftime('%m月%d日')} "
             f"{min_to_time_str(fi['based_on']['arr_min'])} 到达 {fi['from_city']}"
         )
-    else:
-        st.caption("✅ 无需调机（飞机已在出发地）")
 
     if res.get("optimizations"):
         for opt in res["optimizations"]:
             st.info(
                 f"💡 已自动优化 {opt['date'].strftime('%m月%d日')} 的调机段："
-                f"原 `{opt['old_dep_city']} → {opt['arr_city']}`（{opt['d_old']} km），"
+                f"原 `{opt['old_dep_city']} → {opt['arr_city']}`"
+                f"（{opt['d_old']} km，来源：{opt['old_tag']}），"
                 f"改为 `{opt['new_dep_city']} → {opt['arr_city']}`（{opt['d_new']} km），"
                 f"省 {opt['saving_km']} km、约 {min_to_dur_str(opt['old_plan_min'] - opt['new_plan_min'])}"
             )
@@ -1093,28 +1154,32 @@ if run:
             st.error("❌ 无法评估任何飞机")
             st.stop()
 
-        # 对比表
         rows = []
         for c in candidates:
             if "error" in c:
                 rows.append({
                     "飞机": c["reg"],
-                    "调机段数": "-",
-                    "调机时间": "-",
+                    "新增调机": "-",
+                    "原调机": "-",
                     "值勤": "-",
                     "飞行": "-",
                     "状态": f"❌ {c['error'][:36]}",
                 })
             else:
                 r = c["result"]
-                ferry_str = (
-                    min_to_dur_str(c["ferry_min"]) if c["ferry_min"] else "无"
+                new_ferry_str = (
+                    f"{c['ferry_count']} 段 / {min_to_dur_str(c['ferry_min'])}"
+                    if c["ferry_count"] else "无"
+                )
+                orig_ferry_str = (
+                    f"{c['orig_ferry_count']} 段 / {min_to_dur_str(c['orig_ferry_min'])}"
+                    if c["orig_ferry_count"] else "无"
                 )
                 status = "✅ 合规" if c["ok_all"] else "⚠️ 超时"
                 rows.append({
                     "飞机": c["reg"],
-                    "调机段数": c["ferry_count"],
-                    "调机时间": ferry_str,
+                    "新增调机": new_ferry_str,
+                    "原调机": orig_ferry_str,
                     "值勤": min_to_dur_str(r["new_duty_total"]),
                     "飞行": min_to_dur_str(r["new_flight_total"]),
                     "状态": status,
@@ -1130,14 +1195,13 @@ if run:
         selected_reg = best["reg"]
         res = best["result"]
 
-        ferry_str = (
+        new_ferry_str = (
             f"{best['ferry_count']} 段 / {min_to_dur_str(best['ferry_min'])}"
-            if best["ferry_count"]
-            else "无需调机"
+            if best["ferry_count"] else "无需新增调机"
         )
         st.success(
             f"🏆 **推荐飞机：{selected_reg}**"
-            f"（调机 {ferry_str}，值勤 {min_to_dur_str(res['new_duty_total'])}，"
+            f"（新增调机 {new_ferry_str}，值勤 {min_to_dur_str(res['new_duty_total'])}，"
             f"飞行 {min_to_dur_str(res['new_flight_total'])}）"
         )
 
@@ -1187,12 +1251,12 @@ if run:
             if baseline["ferry_info"] and baseline["ferry_info"]["ferry_min"] > 0:
                 fi = baseline["ferry_info"]
                 st.caption(
-                    f"含调机：{fi['from_city']} → {dep_city}  "
+                    f"含新增调机：{fi['from_city']} → {dep_city}  "
                     f"`{min_to_time_str(fi['dep_min'])} - {min_to_time_str(fi['arr_min'])}`  "
                     f"（估算 {min_to_dur_str(fi['ferry_min'])}）"
                 )
             else:
-                st.caption("✅ 无需调机（飞机已在出发地）")
+                st.caption("✅ 无需新增调机（飞机已在出发地）")
 
             if sug.get("relaxed"):
                 st.warning(
