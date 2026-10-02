@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-航班行程安排助手（Excel 计划版 + 自动优化后续调机段 + 起飞时刻推荐）
+航班行程安排助手（Excel 计划版 + 自动优化后续调机段 + 起飞时刻推荐 + 飞行时间自学习）
 """
 
 import streamlit as st
@@ -155,27 +155,81 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * R * asin(sqrt(a))
 
 
-def estimate_flight_minutes(from_icao, to_icao):
-    if not from_icao or not to_icao:
-        return None
-    if from_icao == to_icao:
-        return 0
-    if from_icao not in AIRPORT_COORDS or to_icao not in AIRPORT_COORDS:
-        return None
-    lat1, lon1 = AIRPORT_COORDS[from_icao]
-    lat2, lon2 = AIRPORT_COORDS[to_icao]
-    d = haversine_km(lat1, lon1, lat2, lon2)
-    return round(d / 800 * 60 + 25)
+def _airport_coord_fuzzy(icao):
+    """
+    坐标缺失时的模糊兜底：
+    - 优先精确匹配
+    - 否则同前缀（同国家/地区）找最近的机场作为近似
+    - 都没找到返回 None
+    """
+    if icao in AIRPORT_COORDS:
+        return AIRPORT_COORDS[icao]
+    prefix = icao[:1] if icao else ""
+    same_region = [c for c in AIRPORT_COORDS if c.startswith(prefix)]
+    if same_region:
+        return AIRPORT_COORDS[same_region[0]]
+    return None
+
+
+# ================================================================
+# 飞行时间：自学习 + 分档公式 + 模糊兜底
+# ================================================================
+# key = (from_icao, to_icao)  value = list of minutes
+LEARNED_FLIGHT_MIN = {}
 
 
 def estimate_distance_km(from_icao, to_icao):
     if not from_icao or not to_icao:
         return None
-    if from_icao not in AIRPORT_COORDS or to_icao not in AIRPORT_COORDS:
+    coord_from = _airport_coord_fuzzy(from_icao)
+    coord_to = _airport_coord_fuzzy(to_icao)
+    if not coord_from or not coord_to:
         return None
-    lat1, lon1 = AIRPORT_COORDS[from_icao]
-    lat2, lon2 = AIRPORT_COORDS[to_icao]
+    lat1, lon1 = coord_from
+    lat2, lon2 = coord_to
     return round(haversine_km(lat1, lon1, lat2, lon2))
+
+
+def estimate_flight_minutes(from_icao, to_icao):
+    if not from_icao or not to_icao:
+        return None
+    if from_icao == to_icao:
+        return 0
+
+    # ① 优先用 Excel 学到的真实值
+    learned = LEARNED_FLIGHT_MIN.get((from_icao, to_icao))
+    if learned:
+        return round(sum(learned) / len(learned))
+
+    # ② 用分档公式
+    coord_from = _airport_coord_fuzzy(from_icao)
+    coord_to = _airport_coord_fuzzy(to_icao)
+    if not coord_from or not coord_to:
+        return None
+
+    lat1, lon1 = coord_from
+    lat2, lon2 = coord_to
+    d = haversine_km(lat1, lon1, lat2, lon2)
+
+    if d < 500:
+        speed, overhead = 650, 20
+    elif d < 1500:
+        speed, overhead = 720, 28
+    elif d < 3000:
+        speed, overhead = 760, 35
+    else:
+        speed, overhead = 780, 45
+
+    return round(d / speed * 60 + overhead)
+
+
+def flight_min_source(from_icao, to_icao):
+    """返回飞行时间来源描述，供 UI 显示。"""
+    if (from_icao, to_icao) in LEARNED_FLIGHT_MIN:
+        return "Excel 实测均值"
+    if (from_icao in AIRPORT_COORDS) and (to_icao in AIRPORT_COORDS):
+        return "公式估算"
+    return "公式估算（坐标模糊）"
 
 
 # ================================================================
@@ -203,13 +257,16 @@ def min_to_time_str(m):
 
 
 def min_to_dur_str(m):
-    h, mi = divmod(int(m), 60)
+    m = int(m)
+    sign = "-" if m < 0 else ""
+    m = abs(m)
+    h, mi = divmod(m, 60)
     if h and mi:
-        return f"{h}h{mi:02d}m"
+        return f"{sign}{h}h{mi:02d}m"
     elif h:
-        return f"{h}h"
+        return f"{sign}{h}h"
     else:
-        return f"{mi}m"
+        return f"{sign}{mi}m"
 
 
 def plan_minutes(flight_minutes):
@@ -246,9 +303,12 @@ def to_date(v):
 
 
 # ================================================================
-# 解析 Excel
+# 解析 Excel（含飞行时间自学习）
 # ================================================================
 def load_excel_plan(file_bytes):
+    global LEARNED_FLIGHT_MIN
+    LEARNED_FLIGHT_MIN = {}
+
     wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
     ws = wb["航段(北京时)"] if "航段(北京时)" in wb.sheetnames else wb.active
 
@@ -280,6 +340,13 @@ def load_excel_plan(file_bytes):
         if arr_date is None and arr_min < dep_min:
             arr_dt_date = dep_date + timedelta(days=1)
 
+        # ★ 学习"预计飞行时间"（第 19 列 = S 列）
+        sched_min = time_to_min(ws.cell(r, 19).value)
+        if sched_min and dep_icao and arr_icao and dep_icao != arr_icao:
+            LEARNED_FLIGHT_MIN.setdefault((dep_icao, arr_icao), []).append(sched_min)
+            # 反向也学一份（近似对称）
+            LEARNED_FLIGHT_MIN.setdefault((arr_icao, dep_icao), []).append(sched_min)
+
         rows.append({
             "reg": reg_str,
             "use": str(ws.cell(r, 4).value or "").strip(),
@@ -297,7 +364,7 @@ def load_excel_plan(file_bytes):
 
 
 # ================================================================
-# 解析需求（支持自然语言日期 + 时间词剥离）
+# 解析需求（自然语言日期 + 时间词剥离 + 显式时间标记）
 # ================================================================
 REL_DATE_KW = {
     "今天": 0, "今日": 0,
@@ -328,14 +395,13 @@ def parse_request(text):
             year = today.year
             try:
                 d = date(year, mon, day)
-                # 已过去很久 → 认为是明年
                 if (today - d).days > 180:
                     d = date(year + 1, mon, day)
                 target_date = d
             except Exception:
                 pass
 
-    # ---- 剥离时间词/日期词后解析航线 ----
+    # ---- 剥离日期/时间词后解析航线 ----
     route_text = clean_text
     for kw in list(REL_DATE_KW.keys()) + TIME_WORDS:
         route_text = route_text.replace(kw, " ")
@@ -353,9 +419,10 @@ def parse_request(text):
         if dep_c and arr_c:
             route = (dep_c, arr_c)
 
-    # ---- 飞行时间（区分"显式给出"和"未给出"）----
+    # ---- 飞行时间 ----
     flight_min = None
     has_explicit_time = False
+
     for c in re.findall(r"(?<!\d)(\d{4})(?!\d)", clean_text):
         hh, mm = int(c[:2]), int(c[2:])
         if hh < 24 and mm < 60:
@@ -428,7 +495,6 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
             ferry_min = estimate_flight_minutes(ferry_from_icao, dep_icao_req)
             if ferry_min is None:
                 return {"error": f"❌ 缺少坐标，无法估算 {ferry_from_icao} → {dep_icao_req} 调机时间。"}
-            # 关键修正：用相对 target_date 的绝对分钟，正确处理跨日到达
             last_arr_abs = (
                 (last_of_day["arr_date"] - target_date).days * 1440
                 + last_of_day["arr_min"]
@@ -479,11 +545,10 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
                 "based_on": last_seg,
             }
 
-    # ---- 主段：最早可起飞 = 前置段到达 + 过站 ----
+    # ---- 主段最早可起飞 ----
     if ferry_info is not None:
         earliest_main_dep = ferry_info["arr_min"] + transit
     else:
-        # 当天最后一段已在出发地，无调机
         last_arr_abs = (
             (day_flights[-1]["arr_date"] - target_date).days * 1440
             + day_flights[-1]["arr_min"]
@@ -585,7 +650,7 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
 
     segments.sort(key=lambda x: (x["date"], x["dep_min"]))
 
-    # ---- 后续优化：新增段之后第一个调机段，若绕路则优化 ----
+    # ---- 后续调机段优化 ----
     optimizations = []
     for i, s in enumerate(segments):
         seg_abs_dep = (s["date"] - target_date).days * 1440 + s["dep_min"]
@@ -641,7 +706,6 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
         }
         break
 
-    # 只保留 target_date ± 1 天
     min_date = target_date - timedelta(days=1)
     max_date = target_date + timedelta(days=1)
     visible_segments = [s for s in segments if min_date <= s["date"] <= max_date]
@@ -672,15 +736,12 @@ def analyze_aircraft(flights_all, reg, target_date, dep_city, arr_city,
 
 
 # ================================================================
-# 起飞时刻求解
+# 起飞时刻求解（含放宽模式）
 # ================================================================
 def suggest_departure_times(flights_all, reg, target_date,
                             dep_city, arr_city, flight_min,
-                            objective="earliest", step=15, window_h=12):
-    """
-    在 [最早可起飞, +window_h] 内按 step 分钟步进搜索合规起飞时刻。
-    objective: earliest | latest | shortest_duty
-    """
+                            objective="earliest", step=15, window_h=12,
+                            relax=True):
     dep_icao = get_icao(dep_city)
     arr_icao = get_icao(arr_city)
     if not dep_icao:
@@ -691,7 +752,6 @@ def suggest_departure_times(flights_all, reg, target_date,
     transit = transit_minutes(dep_icao)
     plan_min = plan_minutes(flight_min)
 
-    # 先跑一次常规，拿到"最早可起飞"
     baseline = analyze_aircraft(
         flights_all, reg, target_date,
         dep_city, arr_city, flight_min, transit, plan_min,
@@ -702,6 +762,7 @@ def suggest_departure_times(flights_all, reg, target_date,
     earliest = baseline["main_dep"]
 
     feasible = []
+    fallback = []
     t = earliest
     end = earliest + window_h * 60
     while t <= end:
@@ -710,28 +771,54 @@ def suggest_departure_times(flights_all, reg, target_date,
             dep_city, arr_city, flight_min, transit, plan_min,
             forced_main_dep=t,
         )
-        if not r.get("error") and r["ok_duty"] and r["ok_flight"] and r["rest_ok"]:
-            feasible.append(r)
+        if not r.get("error"):
+            if r["ok_duty"] and r["ok_flight"] and r["rest_ok"]:
+                feasible.append(r)
+            else:
+                fallback.append(r)
         t += step
 
-    if not feasible:
-        return {"error": "❌ 在搜索窗口内未找到合规起飞时刻（值勤/飞行/休息不满足）"}
+    # ---- 有合规方案 ----
+    if feasible:
+        if objective == "earliest":
+            picks = feasible[:3]
+        elif objective == "latest":
+            picks = feasible[-3:]
+        else:
+            feasible_sorted = sorted(feasible, key=lambda x: x["new_duty_total"])
+            picks = feasible_sorted[:3]
+        return {
+            "baseline": baseline, "earliest": earliest,
+            "feasible": feasible, "picks": picks,
+            "objective": objective, "relaxed": False,
+        }
 
-    if objective == "earliest":
-        picks = feasible[:3]
-    elif objective == "latest":
-        picks = feasible[-3:]
-    else:  # shortest_duty
-        feasible_sorted = sorted(feasible, key=lambda x: x["new_duty_total"])
-        picks = feasible_sorted[:3]
+    # ---- 无合规方案：放宽模式给兜底 ----
+    if relax and fallback:
+        def severity(r):
+            over_duty = max(0, r["new_duty_total"] - DUTY_MAX_MIN)
+            over_flight = max(0, r["new_flight_total"] - FLIGHT_MAX_MIN)
+            return over_duty * 2 + over_flight
 
-    return {
-        "baseline": baseline,
-        "earliest": earliest,
-        "feasible": feasible,
-        "picks": picks,
-        "objective": objective,
-    }
+        fallback.sort(key=severity)
+
+        seen = set()
+        picks = []
+        for r in fallback:
+            if r["main_dep"] in seen:
+                continue
+            seen.add(r["main_dep"])
+            picks.append(r)
+            if len(picks) >= 3:
+                break
+
+        return {
+            "baseline": baseline, "earliest": earliest,
+            "feasible": [], "picks": picks,
+            "objective": objective, "relaxed": True,
+        }
+
+    return {"error": "❌ 在搜索窗口内未找到任何方案"}
 
 
 # ================================================================
@@ -777,6 +864,11 @@ with col_b:
     )
 
 st.write("")
+relax_mode = st.checkbox(
+    "🔓 放宽模式（超时也出方案，便于后续申请双机组 / 值勤延长）",
+    value=True,
+    help="勾选后，即使值勤>14h 或飞行>10h，也会给出最接近合规的方案",
+)
 run = st.button("🚀 分析并推荐", type="primary", use_container_width=True)
 
 
@@ -812,7 +904,7 @@ if run:
     dep_icao = get_icao(dep_city)
     arr_icao = get_icao(arr_city)
 
-    # ---- 飞行时间：没有就自动估算 ----
+    # ---- 飞行时间 ----
     flight_min = request["flight_min"]
     auto_estimated = False
     if flight_min is None:
@@ -825,25 +917,24 @@ if run:
 
     plan_min = plan_minutes(flight_min)
     transit = transit_minutes(dep_icao) if dep_icao else 120
+    src = flight_min_source(dep_icao, arr_icao) if auto_estimated else "用户给定"
 
     st.subheader("📋 请求摘要")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("日期", str(target_date))
     c2.metric("飞机", selected_reg)
     c3.metric("航线", f"{dep_icao or dep_city} → {arr_icao or arr_city}")
-    c4.metric(
-        "飞行时间",
-        min_to_dur_str(flight_min) + ("（估算）" if auto_estimated else ""),
-    )
+    c4.metric("飞行时间", min_to_dur_str(flight_min))
     c5.metric("计划时间", min_to_dur_str(plan_min))
     st.caption(
+        f"飞行时间来源：**{src}** ｜ "
         f"过站时间：**{min_to_dur_str(transit)}**"
         f"（{'国内' if is_domestic(dep_icao) else '国际'}）"
     )
 
     st.markdown("---")
 
-    # ---- 分流：有显式时间 → 校验；无 → 求解 ----
+    # ---- 分流 ----
     if request["has_explicit_time"]:
         res = analyze_aircraft(
             flights, selected_reg, target_date,
@@ -940,6 +1031,7 @@ if run:
                 flights, selected_reg, target_date,
                 dep_city, arr_city, flight_min,
                 objective="earliest", step=15, window_h=12,
+                relax=relax_mode,
             )
 
         if sug.get("error"):
@@ -949,7 +1041,6 @@ if run:
         baseline = sug["baseline"]
         picks = sug["picks"]
 
-        # 最早可起飞上下文
         st.info(
             f"📌 最早可起飞：**{min_to_time_str(baseline['main_dep'])}**"
             f"（飞机前置到站 + 过站 {min_to_dur_str(transit)} 之后）"
@@ -963,30 +1054,38 @@ if run:
                 f"（估算 {min_to_dur_str(fi['ferry_min'])}）"
             )
 
-        # 推荐表格
-        st.markdown("**建议起飞时刻（最早 3 个可行方案）**")
+        if sug.get("relaxed"):
+            st.warning(
+                "⚠️ 在搜索范围内**没有任何合规方案**（值勤 > 14h 或飞行 > 10h）。"
+                "以下是超时最少的方案，需申请双机组 / 值勤延长。"
+            )
+        else:
+            st.success("✅ 已找到合规方案")
+
+        st.markdown("**建议起飞时刻（前 3 个方案）**")
         table_rows = []
-        for r in picks:
+        for i, r in enumerate(picks):
+            over_duty = max(0, r["new_duty_total"] - DUTY_MAX_MIN)
+            over_flight = max(0, r["new_flight_total"] - FLIGHT_MAX_MIN)
             table_rows.append({
+                "方案": "#1 推荐" if i == 0 else f"#{i+1}",
                 "起飞": min_to_time_str(r["main_dep"]),
                 "落地": min_to_time_str(r["main_arr"]),
-                "值勤": min_to_dur_str(r["new_duty_total"]),
-                "飞行": min_to_dur_str(r["new_flight_total"]),
+                "值勤": min_to_dur_str(r["new_duty_total"]) + (
+                    f" ⚠️+{min_to_dur_str(over_duty)}" if over_duty else " ✅"
+                ),
+                "飞行": min_to_dur_str(r["new_flight_total"]) + (
+                    f" ⚠️+{min_to_dur_str(over_flight)}" if over_flight else " ✅"
+                ),
                 "前日休息": "✅" if r["rest_ok"] else "❌",
             })
         st.table(table_rows)
 
-        st.success(
-            f"👉 **建议起飞：{min_to_time_str(picks[0]['main_dep'])}**"
-            f"（落地 {min_to_time_str(picks[0]['main_arr'])}，"
-            f"值勤 {min_to_dur_str(picks[0]['new_duty_total'])}）"
-        )
-
-        # 用第一个推荐展示完整行程
+        # 用第一个方案展示完整行程
         res = picks[0]
 
         st.markdown("---")
-        st.subheader(f"✅ {selected_reg} 推荐行程")
+        st.subheader(f"{'⚠️' if sug.get('relaxed') else '✅'} {selected_reg} 推荐行程")
 
         def _compact_line2(seg):
             dep_hm = min_to_time_str(seg["dep_min"]).replace(":", "")
